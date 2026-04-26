@@ -1,15 +1,21 @@
 // Command swe-swe-tunnel is the client side of the swe-swe-tunnel pair.
 //
 // It dials the tunneld server with HTTP Upgrade, runs yamux on the hijacked
-// connection, registers a `unique` name, and reverse-proxies incoming streams
-// to local TCP services. The leftmost label of each request's Host header
+// connection, registers a `unique` name (signing a Register frame with a
+// persistent Ed25519 identity key), and reverse-proxies incoming streams to
+// local TCP services. The leftmost label of each request's Host header
 // selects the local port: `1977.test-tunnel.example.com` → `{target}:1977`.
 package main
 
 import (
 	"bufio"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/tls"
+	"crypto/x509"
+	"encoding/base64"
+	"encoding/pem"
 	"errors"
 	"flag"
 	"fmt"
@@ -21,6 +27,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -33,10 +40,11 @@ import (
 
 func main() {
 	var (
-		server   = flag.String("server", "", "tunnel server URL, e.g. https://tunnel.example.com (required)")
-		unique   = flag.String("unique", "", "requested name (required); server stores it as {unique}-tunnel")
-		target   = flag.String("target", "127.0.0.1", "default forward target host (port comes from Host header label)")
-		insecure = flag.Bool("insecure", false, "skip TLS verification (testing only)")
+		server      = flag.String("server", "", "tunnel server URL, e.g. https://tunnel.example.com (required)")
+		unique      = flag.String("unique", "", "requested name (required); server stores it as {unique}-tunnel")
+		target      = flag.String("target", "127.0.0.1", "default forward target host (port comes from Host header label)")
+		identityKey = flag.String("identity-key", "", "path to Ed25519 identity key (default ~/.swe-swe-tunnel/identity.key)")
+		insecure    = flag.Bool("insecure", false, "skip TLS verification (testing only)")
 	)
 	flag.Parse()
 
@@ -49,6 +57,12 @@ func main() {
 	if *unique == "" {
 		*unique = os.Getenv("SWE_TUNNEL_UNIQUE")
 	}
+	if *identityKey == "" {
+		*identityKey = os.Getenv("SWE_TUNNEL_KEY")
+	}
+	if *identityKey == "" {
+		*identityKey = defaultIdentityKey()
+	}
 	if *server == "" || *unique == "" {
 		flag.Usage()
 		logger.Error("--server and --unique are required (or SWE_TUNNEL_SERVER / SWE_TUNNEL_UNIQUE)")
@@ -59,16 +73,22 @@ func main() {
 		os.Exit(2)
 	}
 
+	priv, err := loadOrCreateIdentity(*identityKey, logger)
+	if err != nil {
+		logger.Error("identity key", "path", *identityKey, "err", err)
+		os.Exit(1)
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	if err := run(ctx, *server, *unique, *target, *insecure, logger); err != nil {
+	if err := run(ctx, *server, *unique, *target, priv, *insecure, logger); err != nil {
 		logger.Error("tunnel failed", "err", err)
 		os.Exit(1)
 	}
 }
 
-func run(ctx context.Context, server, unique, target string, insecure bool, logger *slog.Logger) error {
+func run(ctx context.Context, server, unique, target string, priv ed25519.PrivateKey, insecure bool, logger *slog.Logger) error {
 	u, err := url.Parse(server)
 	if err != nil {
 		return fmt.Errorf("parse --server: %w", err)
@@ -142,21 +162,11 @@ func run(ctx context.Context, server, unique, target string, insecure bool, logg
 		return fmt.Errorf("open control stream: %w", err)
 	}
 
-	if err := control.WriteFrame(stream, control.ClientHello{
-		Version: control.ProtoVersion,
-		Unique:  unique,
-	}); err != nil {
-		return fmt.Errorf("write ClientHello: %w", err)
+	hostname, err := registerWithServer(stream, unique, priv, logger)
+	if err != nil {
+		return fmt.Errorf("register: %w", err)
 	}
-
-	var hello control.ServerHello
-	if err := control.ReadFrame(stream, &hello); err != nil {
-		return fmt.Errorf("read ServerHello: %w", err)
-	}
-	if !hello.OK {
-		return fmt.Errorf("server rejected: %s", hello.Reason)
-	}
-	logger.Info("registered", "hostname", hello.Hostname)
+	logger.Info("registered", "hostname", hostname)
 
 	httpSrv := &http.Server{
 		Handler:           proxyHandler(target, logger),
@@ -184,6 +194,67 @@ func run(ctx context.Context, server, unique, target string, insecure bool, logg
 	defer cancel()
 	_ = httpSrv.Shutdown(shutdownCtx)
 	return nil
+}
+
+// registerWithServer drives the Register → optional Challenge → Proof →
+// RegisterOK exchange. Returns the assigned hostname on success.
+func registerWithServer(stream io.ReadWriter, unique string, priv ed25519.PrivateKey, logger *slog.Logger) (string, error) {
+	pub := priv.Public().(ed25519.PublicKey)
+	now := time.Now().Unix()
+	sig := ed25519.Sign(priv, control.RegisterSigningPayload(pub, unique, now))
+
+	if err := control.WriteMessage(stream, control.KindRegister, control.Register{
+		Version:   control.ProtoVersion,
+		Unique:    unique,
+		Pubkey:    base64.RawStdEncoding.EncodeToString(pub),
+		Timestamp: now,
+		Sig:       base64.RawStdEncoding.EncodeToString(sig),
+	}); err != nil {
+		return "", fmt.Errorf("write Register: %w", err)
+	}
+
+	frame, err := control.ReadFrame(stream)
+	if err != nil {
+		return "", fmt.Errorf("read response: %w", err)
+	}
+
+	if frame.Type == control.KindChallenge {
+		var ch control.Challenge
+		if err := control.DecodePayload(frame, &ch); err != nil {
+			return "", fmt.Errorf("decode Challenge: %w", err)
+		}
+		nonce, err := base64.RawStdEncoding.DecodeString(ch.Nonce)
+		if err != nil {
+			return "", fmt.Errorf("decode nonce: %w", err)
+		}
+		logger.Info("challenge received — proving with stored key", "nonce_bytes", len(nonce))
+		proofSig := ed25519.Sign(priv, control.ProofSigningPayload(nonce))
+		if err := control.WriteMessage(stream, control.KindProof, control.Proof{
+			Sig: base64.RawStdEncoding.EncodeToString(proofSig),
+		}); err != nil {
+			return "", fmt.Errorf("write Proof: %w", err)
+		}
+		// Read the next frame: RegisterOK or Deny.
+		frame, err = control.ReadFrame(stream)
+		if err != nil {
+			return "", fmt.Errorf("read post-Proof response: %w", err)
+		}
+	}
+
+	switch frame.Type {
+	case control.KindRegisterOK:
+		var ok control.RegisterOK
+		if err := control.DecodePayload(frame, &ok); err != nil {
+			return "", fmt.Errorf("decode RegisterOK: %w", err)
+		}
+		return ok.Hostname, nil
+	case control.KindDeny:
+		var d control.Deny
+		_ = control.DecodePayload(frame, &d)
+		return "", fmt.Errorf("server denied: %s", d.Reason)
+	default:
+		return "", fmt.Errorf("unexpected frame type %q", frame.Type)
+	}
 }
 
 func proxyHandler(target string, logger *slog.Logger) http.Handler {
@@ -236,6 +307,55 @@ func portFromHost(h string) string {
 		return ""
 	}
 	return h[:dot]
+}
+
+// loadOrCreateIdentity reads the Ed25519 private key at path, generating one
+// on first run and persisting it as a PKCS8 PEM block.
+func loadOrCreateIdentity(path string, logger *slog.Logger) (ed25519.PrivateKey, error) {
+	data, err := os.ReadFile(path)
+	if err == nil {
+		block, _ := pem.Decode(data)
+		if block == nil {
+			return nil, fmt.Errorf("identity key: not PEM")
+		}
+		key, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+		if err != nil {
+			return nil, fmt.Errorf("parse PKCS8: %w", err)
+		}
+		priv, ok := key.(ed25519.PrivateKey)
+		if !ok {
+			return nil, fmt.Errorf("identity key is %T, want ed25519.PrivateKey", key)
+		}
+		return priv, nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("read identity key: %w", err)
+	}
+
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, fmt.Errorf("mkdir for identity key: %w", err)
+	}
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return nil, fmt.Errorf("generate key: %w", err)
+	}
+	der, err := x509.MarshalPKCS8PrivateKey(priv)
+	if err != nil {
+		return nil, fmt.Errorf("marshal PKCS8: %w", err)
+	}
+	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der})
+	if err := os.WriteFile(path, pemBytes, 0o600); err != nil {
+		return nil, fmt.Errorf("write identity key: %w", err)
+	}
+	logger.Info("generated new identity key", "path", path)
+	return priv, nil
+}
+
+func defaultIdentityKey() string {
+	if home, err := os.UserHomeDir(); err == nil {
+		return filepath.Join(home, ".swe-swe-tunnel", "identity.key")
+	}
+	return ".swe-swe-tunnel/identity.key"
 }
 
 // bufferedConn wraps a net.Conn so reads come from a bufio.Reader (which may

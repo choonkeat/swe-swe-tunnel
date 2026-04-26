@@ -23,6 +23,7 @@ import (
 	"github.com/go-acme/lego/v4/providers/dns/dnsimple"
 
 	"github.com/choonkeat/swe-swe-tunnel/internal/cert"
+	"github.com/choonkeat/swe-swe-tunnel/internal/identity"
 )
 
 func main() {
@@ -92,10 +93,17 @@ func main() {
 		}
 	}()
 
+	idStore, err := identity.Open(filepath.Join(*stateDir, "identities.db"))
+	if err != nil {
+		logger.Error("identity store open failed", "err", err)
+		os.Exit(1)
+	}
+	defer idStore.Close()
+
 	reg := newRegistry()
 
 	mux := http.NewServeMux()
-	mux.Handle("/v1/connect", upgradeHandler(reg, *apex, logger))
+	mux.Handle("/v1/connect", connectHandler(reg, idStore, mgr, *apex, logger))
 	mux.Handle("/", route(reg, *apex, helloHandler(*apex)))
 
 	srv := &http.Server{

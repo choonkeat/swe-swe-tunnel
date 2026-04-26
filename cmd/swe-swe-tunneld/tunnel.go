@@ -1,20 +1,33 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/hashicorp/yamux"
 
+	"github.com/choonkeat/swe-swe-tunnel/internal/cert"
 	"github.com/choonkeat/swe-swe-tunnel/internal/control"
+	"github.com/choonkeat/swe-swe-tunnel/internal/identity"
 )
+
+// maxClockSkew bounds the acceptable distance between client-reported
+// timestamps and server time. Bigger window = easier replay; smaller window =
+// brittle to clock drift.
+const maxClockSkew = 5 * time.Minute
 
 // tunnelSession bundles a yamux session with its dedicated reverse proxy.
 // Building the proxy once per session lets us reuse a single Transport.
@@ -38,9 +51,6 @@ func (r *registry) add(label string, ts *tunnelSession) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if _, ok := r.sessions[label]; ok {
-		// Phase 2: a duplicate connection means another client claimed the
-		// same `unique`. Refuse. Phase 3 replaces this with pubkey-authed
-		// takeover.
 		return fmt.Errorf("label %q already connected", label)
 	}
 	r.sessions[label] = ts
@@ -61,8 +71,16 @@ func (r *registry) get(label string) *tunnelSession {
 	return r.sessions[label]
 }
 
-// upgradeHandler returns the http.Handler for POST /v1/connect.
-func upgradeHandler(reg *registry, apex string, logger *slog.Logger) http.Handler {
+// connectHandler returns the http.Handler for POST /v1/connect.
+//
+// Flow:
+//  1. validate Upgrade headers, hijack, write 101 Switching Protocols
+//  2. yamux.Server, accept stream 1
+//  3. read Register, verify Ed25519 sig + clock skew + unique shape
+//  4. lookup identity store; on first registration, EnsureName issues the
+//     per-session cert in-line. On reclaim, run Challenge/Proof.
+//  5. send RegisterOK, register session, block until session.Close
+func connectHandler(reg *registry, store *identity.Store, certMgr *cert.Manager, apex string, logger *slog.Logger) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "POST required", http.StatusMethodNotAllowed)
@@ -115,39 +133,182 @@ func upgradeHandler(reg *registry, apex string, logger *slog.Logger) http.Handle
 			return
 		}
 
-		var hello control.ClientHello
-		if err := control.ReadFrame(stream, &hello); err != nil {
-			logger.Warn("read ClientHello failed", "err", err)
-			_ = control.WriteFrame(stream, control.ServerHello{OK: false, Reason: "bad hello"})
+		ctx := r.Context()
+		regResult, ok := handleRegister(ctx, stream, store, certMgr, logger, conn.RemoteAddr().String())
+		if !ok {
 			return
 		}
-		if hello.Version != control.ProtoVersion {
-			_ = control.WriteFrame(stream, control.ServerHello{OK: false, Reason: "version mismatch"})
-			return
-		}
-		if err := control.ValidateUnique(hello.Unique); err != nil {
-			_ = control.WriteFrame(stream, control.ServerHello{OK: false, Reason: err.Error()})
-			return
-		}
-		label := control.TunnelLabel(hello.Unique)
-		hostname := label + "." + apex
 
 		ts := &tunnelSession{sess: sess, proxy: newSessionProxy(sess, logger)}
-		if err := reg.add(label, ts); err != nil {
-			_ = control.WriteFrame(stream, control.ServerHello{OK: false, Reason: err.Error()})
+		if err := reg.add(regResult.label, ts); err != nil {
+			sendDeny(stream, err.Error())
 			return
 		}
-		defer reg.remove(label, ts)
+		defer reg.remove(regResult.label, ts)
 
-		if err := control.WriteFrame(stream, control.ServerHello{OK: true, Hostname: hostname}); err != nil {
-			logger.Warn("write ServerHello failed", "err", err)
+		if err := control.WriteMessage(stream, control.KindRegisterOK, control.RegisterOK{
+			Hostname: regResult.label + "." + apex,
+		}); err != nil {
+			logger.Warn("write RegisterOK failed", "err", err)
 			return
 		}
-		logger.Info("tunnel connected", "label", label, "remote", conn.RemoteAddr().String())
+		logger.Info("tunnel connected",
+			"unique", regResult.unique,
+			"label", regResult.label,
+			"remote", conn.RemoteAddr().String(),
+			"new_registration", regResult.newRegistration,
+		)
 
 		<-sess.CloseChan()
-		logger.Info("tunnel disconnected", "label", label)
+		logger.Info("tunnel disconnected", "label", regResult.label)
 	})
+}
+
+type registerResult struct {
+	unique          string
+	label           string
+	newRegistration bool
+}
+
+// handleRegister reads the Register frame, validates it, runs identity lookup
+// (with optional Challenge/Proof on pubkey mismatch), and ensures the
+// per-session cert exists. Sends Deny on any failure path.
+func handleRegister(
+	ctx context.Context,
+	stream io.ReadWriter,
+	store *identity.Store,
+	certMgr *cert.Manager,
+	logger *slog.Logger,
+	remoteAddr string,
+) (registerResult, bool) {
+	frame, err := control.ReadFrame(stream)
+	if err != nil {
+		logger.Warn("read Register failed", "err", err)
+		return registerResult{}, false
+	}
+	if frame.Type != control.KindRegister {
+		sendDeny(stream, fmt.Sprintf("expected register, got %q", frame.Type))
+		return registerResult{}, false
+	}
+	var reg control.Register
+	if err := control.DecodePayload(frame, &reg); err != nil {
+		sendDeny(stream, "bad register payload")
+		return registerResult{}, false
+	}
+	if reg.Version != control.ProtoVersion {
+		sendDeny(stream, fmt.Sprintf("unsupported protocol version %d", reg.Version))
+		return registerResult{}, false
+	}
+	if err := control.ValidateUnique(reg.Unique); err != nil {
+		sendDeny(stream, err.Error())
+		return registerResult{}, false
+	}
+
+	pub, err := base64.RawStdEncoding.DecodeString(reg.Pubkey)
+	if err != nil || len(pub) != ed25519.PublicKeySize {
+		sendDeny(stream, "bad pubkey")
+		return registerResult{}, false
+	}
+	sig, err := base64.RawStdEncoding.DecodeString(reg.Sig)
+	if err != nil || len(sig) != ed25519.SignatureSize {
+		sendDeny(stream, "bad sig")
+		return registerResult{}, false
+	}
+
+	now := time.Now().UTC()
+	ts := time.Unix(reg.Timestamp, 0).UTC()
+	if d := now.Sub(ts); d > maxClockSkew || -d > maxClockSkew {
+		sendDeny(stream, "timestamp out of range")
+		return registerResult{}, false
+	}
+
+	if !ed25519.Verify(pub, control.RegisterSigningPayload(pub, reg.Unique, reg.Timestamp), sig) {
+		sendDeny(stream, "signature invalid")
+		return registerResult{}, false
+	}
+
+	label := control.TunnelLabel(reg.Unique)
+
+	existing, err := store.Get(ctx, reg.Unique)
+	switch {
+	case errors.Is(err, identity.ErrNotFound):
+		// New unique → claim it. Issue cert FIRST (may fail; if so, the
+		// store stays clean).
+		if err := certMgr.EnsureName(ctx, label); err != nil {
+			logger.Error("ensure-cert failed for new register",
+				"unique", reg.Unique, "label", label, "remote", remoteAddr, "err", err)
+			sendDeny(stream, "cert issuance failed")
+			return registerResult{}, false
+		}
+		if err := store.Put(ctx, reg.Unique, pub, now); err != nil {
+			logger.Error("identity put failed", "unique", reg.Unique, "err", err)
+			sendDeny(stream, "store error")
+			return registerResult{}, false
+		}
+		return registerResult{unique: reg.Unique, label: label, newRegistration: true}, true
+
+	case err != nil:
+		logger.Error("identity get failed", "unique", reg.Unique, "err", err)
+		sendDeny(stream, "store error")
+		return registerResult{}, false
+	}
+
+	// Existing entry — pubkey match → idempotent reconnect.
+	if bytes.Equal(existing.Pubkey, pub) {
+		_ = store.Touch(ctx, reg.Unique, now)
+		return registerResult{unique: reg.Unique, label: label, newRegistration: false}, true
+	}
+
+	// Existing entry, different pubkey → challenge & require proof from the
+	// stored key.
+	var nonce [32]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		sendDeny(stream, "internal error")
+		return registerResult{}, false
+	}
+	if err := control.WriteMessage(stream, control.KindChallenge, control.Challenge{
+		Nonce: base64.RawStdEncoding.EncodeToString(nonce[:]),
+	}); err != nil {
+		logger.Warn("write challenge failed", "err", err)
+		return registerResult{}, false
+	}
+
+	proofFrame, err := control.ReadFrame(stream)
+	if err != nil {
+		logger.Warn("read proof failed", "err", err)
+		return registerResult{}, false
+	}
+	if proofFrame.Type != control.KindProof {
+		sendDeny(stream, fmt.Sprintf("expected proof, got %q", proofFrame.Type))
+		return registerResult{}, false
+	}
+	var proof control.Proof
+	if err := control.DecodePayload(proofFrame, &proof); err != nil {
+		sendDeny(stream, "bad proof payload")
+		return registerResult{}, false
+	}
+	proofSig, err := base64.RawStdEncoding.DecodeString(proof.Sig)
+	if err != nil || len(proofSig) != ed25519.SignatureSize {
+		sendDeny(stream, "bad proof sig")
+		return registerResult{}, false
+	}
+	if !ed25519.Verify(existing.Pubkey, control.ProofSigningPayload(nonce[:]), proofSig) {
+		logger.Warn("proof failed", "unique", reg.Unique, "remote", remoteAddr)
+		sendDeny(stream, "key_mismatch")
+		return registerResult{}, false
+	}
+	// Successful proof → rotate to new pubkey.
+	if err := store.Rotate(ctx, reg.Unique, pub, now); err != nil {
+		logger.Error("rotate failed", "unique", reg.Unique, "err", err)
+		sendDeny(stream, "store error")
+		return registerResult{}, false
+	}
+	logger.Info("identity key rotated", "unique", reg.Unique, "remote", remoteAddr)
+	return registerResult{unique: reg.Unique, label: label, newRegistration: false}, true
+}
+
+func sendDeny(w io.Writer, reason string) {
+	_ = control.WriteMessage(w, control.KindDeny, control.Deny{Reason: reason})
 }
 
 // route returns the catch-all http.Handler. r.Host matching
@@ -164,7 +325,6 @@ func route(reg *registry, apex string, fallback http.Handler) http.Handler {
 		}
 		dot := strings.IndexByte(rest, '.')
 		if dot < 0 {
-			// `{label}.{apex}` with no port part — fall through to apex landing.
 			fallback.ServeHTTP(w, r)
 			return
 		}
