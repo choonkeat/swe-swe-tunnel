@@ -24,15 +24,18 @@ A self-hosted reverse tunnel that gives a swe-swe instance (or any localhost-bou
 ```
                             tunnel.example.com (server)
                                      │
-   browser ──TLS──> :443 ─SNI demux─┤   ┌─ DNSimple API ─┐
-                                     │   │                │
-                                     ├──< lego/v4 (DNS-01) > Let's Encrypt
-                                     │   │                │
-                                     │   └────────────────┘
-                                     │
-                          control TLS │  (single conn per client)
-                            ┌────────┘
-                            │   yamux multiplex
+   browser ──TLS──> :443  ──http.Server──┐   ┌─ DNSimple API ─┐
+                                          │   │                │
+                                          ├──< lego/v4 (DNS-01) > Let's Encrypt
+                                          │   │                │
+                                          │   └────────────────┘
+                                          │
+                            POST /v1/connect (HTTP Upgrade)
+                            from tunnel-client; the server
+                            hijacks and runs yamux over the
+                            same TCP connection
+                            ┌─────────────┘
+                            │   yamux multiplex (one session per client)
                             ▼
                        tunnel-client (on swe-swe host)
                             │
@@ -42,6 +45,12 @@ A self-hosted reverse tunnel that gives a swe-swe instance (or any localhost-bou
                             ▼
                          swe-swe-server
 ```
+
+Key point: there is **one** public listener (`:443`). The control channel is
+just an HTTP request to that same port that gets upgraded into a yamux
+session. There is no separate `:7444`, no SNI peeking, no ALPN demux. Browser
+data plane and tunnel control plane share `:443`; routing is decided by HTTP
+`Host` header (browser) vs path (`POST /v1/connect`, control).
 
 ## Naming & DNS
 
@@ -164,75 +173,99 @@ Backups are critical: losing this DB means orphaned uniques, since reclaiming re
 
 ## Wire protocol
 
-Two channels:
-1. **Control / multiplex channel** — long-lived TLS connection from client to server, wrapped in `hashicorp/yamux`. Each multiplexed stream carries either a control message or a forwarded data stream.
-2. **Browser data plane** — the public-facing :443 listener. Demuxes by SNI + port to a yamux stream on the right control connection.
+The same TCP/TLS port (`:443`) carries two kinds of traffic, distinguished by
+the HTTP request line:
+
+1. **Control / multiplex channel** — `POST /v1/connect` with
+   `Connection: Upgrade, Upgrade: swe-swe-tunnel/1`. The server replies with
+   `101 Switching Protocols`, hijacks the conn, and wraps it in a
+   `hashicorp/yamux` server session. The client wraps the same conn in a yamux
+   client session. Subsequent control messages travel over yamux stream 1;
+   data plane traffic uses other streams (server→client direction).
+2. **Browser data plane** — every other request hitting `:443`. The server
+   inspects `Host`, looks up the matching session, and reverse-proxies the
+   request to the client through a `yamux.Stream`-backed `http.Transport`.
 
 ### Control connection
 
-- TLS 1.3, server cert is `*.example.com` (so client validates against `tunnel.example.com`).
+- TLS 1.3, server cert is `*.example.com`. Client validates against the apex
+  cert chain (it does not need a per-session cert for control).
 - Client connects on first run; reconnects with exponential backoff (1s → 60s).
-- After TLS handshake, client opens stream 1 and exchanges hello frames:
-  - `ClientHello{ version, unique, pubkey, sig }` (the REGISTER message)
-  - `ServerHello{ version, accepted, hostname, port_range_assigned }`
+- After the upgrade, client opens yamux stream 1 and exchanges hello frames:
+  - `ClientHello{ version, unique }` — Phase 2.
+  - `ClientHello{ version, unique, pubkey, sig }` — Phase 3 adds REGISTER fields.
+  - `ServerHello{ ok, hostname, reason }`.
 
-### Stream framing
+Each control frame is length-prefixed: 4-byte big-endian length, then UTF-8
+JSON body. Non-control bytes (yamux's own framing) are handled by yamux.
 
-After hello, all data is multiplexed via yamux. Each new browser connection on the public side opens a new yamux stream toward the client. The first frame on the stream is a small header:
+### Browser data plane (HTTP-level)
 
-```
-StreamHeader {
-  dst_port: uint16,
-  client_addr: string,      // for X-Forwarded-For
-  request_protocol: enum(http, http+ws, tcp),
-}
-```
+The server's catch-all handler:
 
-After the header, raw bytes flow both directions until EOF or RST.
+1. Parses `r.Host` (lower-cased, port stripped).
+2. Strips the apex suffix `.example.com`. If the remainder isn't of the form
+   `{port}.{label}-tunnel`, falls through to the apex landing page.
+3. Looks up `{label}-tunnel` in the in-memory session registry.
+4. If absent → returns a 502 "tunnel offline" page.
+5. If present → uses the session-scoped `httputil.ReverseProxy`. Each request
+   opens a fresh yamux stream (`session.Open()`); `Connection: keep-alive` is
+   disabled to keep stream lifecycle tied to request lifecycle. The
+   `Host` header is preserved end-to-end so the client can route by port.
+
+WebSocket / HTTP-Upgrade requests work transparently through
+`httputil.ReverseProxy` (Go ≥ 1.12); after the upstream response is seen as
+101, the proxy switches to bidirectional copy and the yamux stream stays open
+for the duration of the WS session.
 
 ### Why yamux, not HTTP/2
 
-- HTTP/2 server-initiated streams are awkward (PUSH is deprecated; we'd reverse the client/server roles). yamux makes both sides peers.
+- HTTP/2 server-initiated streams are awkward (PUSH is deprecated; we'd reverse
+  the client/server roles). yamux makes both sides peers.
 - yamux handles flow control, keepalive, graceful close.
-- We're already terminating TLS at the public listener, so no TLS-in-TLS overhead inside the tunnel.
+- We're already terminating TLS at the public listener, so there's no
+  TLS-in-TLS overhead inside the tunnel.
 
 ## Data plane
 
 ### Public listener
 
-One `net.Listen("tcp", ":443")`. On accept:
-1. Peek TLS ClientHello, extract SNI.
-2. Parse SNI: `{port_label}.{unique-tunnel}.example.com`.
-3. Look up `unique-tunnel` → active control connection. Reject if no client connected.
-4. Look up cert for `*.{unique-tunnel}.example.com`, present in TLS handshake.
-5. After handshake, open a yamux stream on the client's control connection.
-6. Send `StreamHeader{dst_port=parse(port_label), ...}`.
-7. `io.Copy` both directions until close.
+One `http.Server` on `:443`, TLS configured via `tls.Config.GetCertificate`.
+The server's mux:
 
-If the unique is registered but no client is currently connected: return TLS handshake completion with a 502 Bad Gateway HTTP body. Browsers see "tunnel offline" rather than a connection error.
+- `POST /v1/connect` → upgrade handler (above).
+- `/...` → host-routing handler that either reverse-proxies into a tunnel or
+  serves the apex hello page.
+
+`tls.Config.GetCertificate` picks a cert by SNI (exact match → one-level
+wildcard → fall back to apex). Per-session wildcards `*.{label}.{apex}` are
+loaded from disk on boot via `Manager.LoadAllFromDisk()` and after each
+`--ensure-cert` run.
 
 ### Port mapping
 
-The tunnel doesn't bind a port range on the public side — it only binds :443. The "port" of `{port}.{unique}-tunnel.example.com` is *encoded in the hostname*; the actual wire port is always 443.
+The tunnel doesn't bind a port range on the public side — it only binds
+`:443`. The "port" of `{port}.{unique}-tunnel.example.com` is *encoded in the
+hostname*; the actual wire port is always 443.
 
-The client decides where to forward. Default config: forward stream's `dst_port` to `127.0.0.1:dst_port`. Configurable per port:
-
-```toml
-[forward]
-default = "127.0.0.1"
-"3000" = "192.168.1.50:8080"   # override
-```
+The browser-side server preserves the `Host` header through the proxy. The
+client extracts the leftmost label as the port number and forwards to
+`{target}:{port}` — by default `127.0.0.1:{port}`. Per-port overrides
+(`--port-target=3000=192.168.1.50:8080`, planned) let the client redirect
+specific ports elsewhere.
 
 ### HTTP-level concerns
 
-For `request_protocol=http` streams, the client adds:
+`httputil.ReverseProxy.SetXForwarded()` injects:
 - `X-Forwarded-Proto: https`
 - `X-Forwarded-Host: {port}.{unique}-tunnel.example.com`
 - `X-Forwarded-For: {client_addr}`
 
-WebSocket upgrade is transparent (yamux just pipes bytes after the upgrade response).
+WebSocket / HTTP Upgrade is transparent (Go's ReverseProxy detects 101 and
+switches to bidirectional byte copy; yamux pipes the bytes through unchanged).
 
-For `request_protocol=tcp` streams (future, not in v1), the client skips header injection and pipes raw bytes.
+Raw-TCP forwarding (planned, post-v1) would skip the HTTP layer entirely and
+piggyback on a different request path, e.g. `POST /v1/tcp/{label}/{port}`.
 
 ## Configuration
 
@@ -242,13 +275,14 @@ Flag > env > default.
 
 | Flag | Env | Default | Notes |
 |---|---|---|---|
-| `--listen` | `SWE_TUNNEL_LISTEN` | `:443` | Public listener |
-| `--control-listen` | `SWE_TUNNEL_CONTROL_LISTEN` | `:7444` | Control channel listener |
+| `--listen` | `SWE_TUNNEL_LISTEN` | `:443` | Public listener (also carries control via `POST /v1/connect`) |
 | `--state-dir` | `SWE_TUNNEL_STATE` | `~/.swe-swe-tunnel` | All persistent state |
 | `--apex-domain` | `SWE_TUNNEL_APEX` | `example.com` | DNS apex |
 | `--acme-email` | `SWE_TUNNEL_ACME_EMAIL` | required | LE registration |
 | `--dns-provider` | `SWE_TUNNEL_DNS_PROVIDER` | `dnsimple` | passed to lego |
-| `--rate-limit-register` | env | `5/hour` per IP | sliding window |
+| `--acme-staging` | — | false | use Let's Encrypt staging directory |
+| `--ensure-cert` | — | "" | admin one-shot: issue `*.{label}.{apex}` and exit |
+| `--rate-limit-register` | env | `5/hour` per IP | sliding window (Phase 3) |
 
 DNS provider credentials follow `lego`'s env conventions (`DNSIMPLE_OAUTH_TOKEN`, `CLOUDFLARE_DNS_API_TOKEN`, etc.).
 
@@ -256,12 +290,13 @@ DNS provider credentials follow `lego`'s env conventions (`DNSIMPLE_OAUTH_TOKEN`
 
 | Flag | Env | Default | Notes |
 |---|---|---|---|
-| `--server` | `SWE_TUNNEL_SERVER` | required | e.g. `tunnel.example.com:7444` |
-| `--unique` | `SWE_TUNNEL_UNIQUE` | required | requested name |
-| `--identity-key` | `SWE_TUNNEL_KEY` | `~/.swe-swe-tunnel/identity.key` | Ed25519 private key, generated on first run |
+| `--server` | `SWE_TUNNEL_SERVER` | required | e.g. `https://tunnel.example.com` |
+| `--unique` | `SWE_TUNNEL_UNIQUE` | required | requested name (server appends `-tunnel`) |
+| `--identity-key` | `SWE_TUNNEL_KEY` | `~/.swe-swe-tunnel/identity.key` | Ed25519 private key, generated on first run (Phase 3) |
 | `--target` | `SWE_TUNNEL_TARGET` | `127.0.0.1` | default forward target |
-| `--port-target` | repeated | none | per-port override `--port-target=3000=192.168.1.5:8080` |
-| `--state-file` | `SWE_TUNNEL_STATE_FILE` | `/workspace/.swe-swe/tunnel-state.json` | written after REGISTER_OK |
+| `--port-target` | repeated | none | per-port override `--port-target=3000=192.168.1.5:8080` (planned) |
+| `--insecure` | — | false | skip TLS verification (testing only) |
+| `--state-file` | `SWE_TUNNEL_STATE_FILE` | `/workspace/.swe-swe/tunnel-state.json` | written after REGISTER_OK (Phase 3) |
 
 State file (consumed by swe-swe):
 ```json
@@ -285,11 +320,16 @@ Each phase is independently shippable and testable.
 
 ### Phase 2 — control channel + single-port forward
 
-- TLS control listener on `:7444`.
-- Yamux session per client.
-- ClientHello/ServerHello with hardcoded `unique=test`.
-- Forward `:1977` (only) browser-side → `127.0.0.1:1977` on the client.
-- swe-swe accessible via `1977.test-tunnel.example.com` (manual DNS + cert for first cut).
+- Single `:443` listener; control channel is `POST /v1/connect` with HTTP
+  Upgrade, hijacked into yamux.
+- One yamux session per client; in-memory `map[label]*Session` registry.
+- ClientHello/ServerHello, no auth (any `unique` accepted).
+- Browser-side forward via `httputil.ReverseProxy` keyed on `Host` header;
+  client picks port from leftmost label.
+- Per-session wildcard cert acquired via the new `--ensure-cert <label>`
+  admin subcommand on `swe-swe-tunneld`. DNS A record added manually for the
+  first session.
+- Smoke target: swe-swe accessible via `1977.test-tunnel.example.com`.
 
 ### Phase 3 — registration & identity
 
@@ -299,12 +339,15 @@ Each phase is independently shippable and testable.
 - DNSimple API integration to create/remove `*.{unique}-tunnel.example.com` A records.
 - Per-session DNS-01 issuance via lego.
 
-### Phase 4 — multi-port + SNI demux
+### Phase 4 — multi-port polish
 
-- Public listener uses `tls.Config.GetCertificate` keyed by middle SNI label.
-- Stream header carries `dst_port`.
+- Multi-port works as soon as Phase 2 ships (port encoded in Host label,
+  preserved through ReverseProxy). This phase tightens it up:
 - Client honors `--port-target` overrides.
-- Reject SNIs that don't match `{label}.{unique-tunnel}.example.com`.
+- Optional allowlist of forwardable ports.
+- Reject Host headers that don't match `{port}.{unique-tunnel}.{apex}`.
+- Public-listener `tls.Config.GetCertificate` already keyed by SNI suffix
+  match (implemented in Phase 2 via `cert.Manager`).
 
 ### Phase 5 — swe-swe integration
 
@@ -343,36 +386,48 @@ Each phase is independently shippable and testable.
 
 ## Wire protocol — message reference (informative)
 
-All messages JSON over a single yamux stream (stream 1 of the control conn). One message per frame. UTF-8.
+After the HTTP Upgrade handshake on `POST /v1/connect`, both sides wrap the
+hijacked TCP/TLS conn in yamux. Stream 1 carries length-prefixed JSON control
+frames. All other yamux streams (server-initiated, client-accepted) carry raw
+HTTP/1.1 traffic.
+
+### Frame format on stream 1
 
 ```
-{ "type": "REGISTER",
-  "unique": "abc",
-  "pubkey": "Ed25519:base64...",
-  "timestamp": 1714137600,
-  "sig": "base64..." }
-
-{ "type": "CHALLENGE", "nonce": "base64..." }
-
-{ "type": "PROOF", "sig": "base64..." }
-
-{ "type": "REGISTER_OK",
-  "unique": "abc",
-  "hostname": "abc-tunnel.example.com" }
-
-{ "type": "DENY", "reason": "rate_limited" | "key_mismatch" | "invalid_unique" }
-
-{ "type": "DEREGISTER", "sig": "base64..." }
+[4 bytes big-endian length][JSON payload, UTF-8, ≤ 64 KiB]
 ```
 
-Forwarded streams open as new yamux streams (not stream 1). First frame is a binary `StreamHeader`:
+### Phase 2 messages
 
 ```
-struct StreamHeader {
-  uint8  version;           // 1
-  uint16 dst_port;
-  uint8  protocol;          // 0=http, 1=tcp
-  uint8  client_addr_len;
-  uint8  client_addr[client_addr_len];
-}
+ClientHello = { "version": 1, "unique": "abc" }
+
+ServerHello = { "ok": true,  "hostname": "abc-tunnel.example.com" }
+            | { "ok": false, "reason": "<human-readable>" }
 ```
+
+### Phase 3 additions (planned)
+
+```
+ClientHello = { "version": 1, "unique": "abc",
+                "pubkey":  "Ed25519:base64...",
+                "timestamp": 1714137600,
+                "sig":     "Ed25519(pubkey || unique || timestamp)" }
+
+ServerChallenge = { "type": "challenge", "nonce": "base64..." }
+ClientProof     = { "type": "proof",     "sig":   "Ed25519(stored_pubkey, nonce)" }
+
+ClientDeregister = { "type": "deregister", "sig": "base64..." }
+```
+
+DENY conditions surface as `ServerHello{ok:false, reason:"rate_limited" |
+"key_mismatch" | "invalid_unique" | ...}`.
+
+### Forwarded streams
+
+Each browser request to `:443` opens a fresh yamux stream toward the client.
+The bytes on the stream are vanilla HTTP/1.1 — no extra framing. The server
+wraps the stream in `http.Transport` via `DialContext`, and the client serves
+it through `http.Server` running on the yamux session as a Listener. The
+`Host` header is preserved end-to-end so the client can extract the leftmost
+label and pick a forward port.

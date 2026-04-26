@@ -9,6 +9,7 @@ require (
 	github.com/dnsimple/dnsimple-go v1.7.0 // indirect
 	github.com/go-jose/go-jose/v4 v4.0.4 // indirect
 	github.com/google/go-querystring v1.1.0 // indirect
+	github.com/hashicorp/yamux v0.1.2 // indirect
 	github.com/miekg/dns v1.1.62 // indirect
 	github.com/shopspring/decimal v1.3.1 // indirect
 	golang.org/x/crypto v0.31.0 // indirect

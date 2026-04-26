@@ -1,7 +1,9 @@
 // Command swe-swe-tunneld is the public-facing tunnel server.
 //
-// Phase 1: acquires *.{apex} via Let's Encrypt DNS-01, serves a hello page
-// over HTTPS, and renews the cert daily. No tunneling logic yet.
+// Phase 2: a single :443 listener serves the apex hello page and accepts
+// tunnel-control connections at POST /v1/connect (HTTP Upgrade →
+// yamux). Browser requests for `{port}.{label}-tunnel.{apex}` are
+// reverse-proxied through the matching tunnel.
 package main
 
 import (
@@ -25,12 +27,13 @@ import (
 
 func main() {
 	var (
-		listen    = flag.String("listen", ":443", "HTTPS listener address")
-		apex      = flag.String("apex-domain", "", "DNS apex (required), e.g. example.com")
-		email     = flag.String("acme-email", "", "ACME account email (required)")
-		stateDir  = flag.String("state-dir", defaultStateDir(), "persistent state directory")
-		dnsProv   = flag.String("dns-provider", "dnsimple", "lego DNS provider")
-		staging   = flag.Bool("acme-staging", false, "use Let's Encrypt staging (untrusted, no rate limits)")
+		listen      = flag.String("listen", ":443", "HTTPS listener address")
+		apex        = flag.String("apex-domain", "", "DNS apex (required), e.g. example.com")
+		email       = flag.String("acme-email", "", "ACME account email (required)")
+		stateDir    = flag.String("state-dir", defaultStateDir(), "persistent state directory")
+		dnsProv     = flag.String("dns-provider", "dnsimple", "lego DNS provider")
+		staging     = flag.Bool("acme-staging", false, "use Let's Encrypt staging (untrusted, no rate limits)")
+		ensureCert  = flag.String("ensure-cert", "", "issue *.{label}.{apex} cert and exit (admin one-shot)")
 	)
 	flag.Parse()
 
@@ -60,9 +63,24 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	if *ensureCert != "" {
+		if err := mgr.EnsureName(ctx, *ensureCert); err != nil {
+			logger.Error("ensure-cert failed", "label", *ensureCert, "err", err)
+			os.Exit(1)
+		}
+		logger.Info("cert ensured", "label", *ensureCert, "hostname", *ensureCert+"."+*apex)
+		return
+	}
+
 	if err := mgr.Ensure(ctx); err != nil {
 		logger.Error("cert acquisition failed", "err", err)
 		os.Exit(1)
+	}
+
+	if n, err := mgr.LoadAllFromDisk(); err != nil {
+		logger.Warn("load-all-from-disk had errors", "err", err)
+	} else {
+		logger.Info("loaded certs from disk", "count", n)
 	}
 
 	go func() {
@@ -71,9 +89,15 @@ func main() {
 		}
 	}()
 
+	reg := newRegistry()
+
+	mux := http.NewServeMux()
+	mux.Handle("/v1/connect", upgradeHandler(reg, *apex, logger))
+	mux.Handle("/", route(reg, *apex, helloHandler(*apex)))
+
 	srv := &http.Server{
 		Addr:              *listen,
-		Handler:           helloHandler(*apex),
+		Handler:           mux,
 		TLSConfig:         &tls.Config{GetCertificate: mgr.GetCertificate, MinVersion: tls.VersionTLS12},
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       2 * time.Minute,

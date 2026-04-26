@@ -1,8 +1,11 @@
-// Package cert manages the apex wildcard certificate for the tunnel server.
+// Package cert manages wildcard certificates for the tunnel server.
 //
-// It embeds lego/v4 to obtain *.{apex} via DNS-01, persists state in a
-// directory layout compatible with the lego CLI, and exposes a hot-swappable
-// *tls.Certificate for use in tls.Config.GetCertificate.
+// The manager holds an apex wildcard (*.{Apex}) for the public landing page
+// and the control-channel hostname, plus zero or more per-session wildcards
+// (*.{label}.{Apex}) for tunneled subdomains. Each cert is obtained via lego
+// DNS-01 and persisted in a directory layout compatible with the lego CLI.
+// tls.Config.GetCertificate dispatches by SNI: exact match first, then a
+// one-level wildcard match, then falls back to the apex cert.
 package cert
 
 import (
@@ -20,6 +23,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -37,21 +41,30 @@ const (
 	leStaging    = "https://acme-staging-v02.api.letsencrypt.org/directory"
 )
 
-// Manager holds the apex wildcard cert and renews it in the background.
+// Manager holds the apex wildcard cert plus any per-session wildcards, and
+// renews them in the background.
 type Manager struct {
-	StateDir    string                          // ~/.swe-swe-tunnel
-	Email       string                          // ACME account email
-	Apex        string                          // e.g. "example.com"; cert covers Apex and *.Apex
-	CADirURL    string                          // leProduction or leStaging
-	NewProvider func() (challenge.Provider, error) // factory for a fresh DNS provider per call
+	StateDir    string
+	Email       string
+	Apex        string
+	CADirURL    string
+	NewProvider func() (challenge.Provider, error)
 
-	mu   sync.RWMutex
-	cert *tls.Certificate
+	mu       sync.RWMutex
+	entries  map[string]*certEntry // baseName → entry
+	exact    map[string]*certEntry // exact-match SAN → entry
+	wildcard map[string]*certEntry // wildcard parent (e.g. "example.com") → entry
 
 	logger *slog.Logger
 }
 
-// New constructs a Manager. CADirURL defaults to leProduction if empty.
+type certEntry struct {
+	cert     *tls.Certificate
+	sans     []string
+	baseName string
+}
+
+// New constructs a Manager. CADirURL defaults to leProduction.
 func New(stateDir, email, apex string, newProvider func() (challenge.Provider, error), logger *slog.Logger) *Manager {
 	if logger == nil {
 		logger = slog.Default()
@@ -62,6 +75,9 @@ func New(stateDir, email, apex string, newProvider func() (challenge.Provider, e
 		Apex:        apex,
 		CADirURL:    leProduction,
 		NewProvider: newProvider,
+		entries:     make(map[string]*certEntry),
+		exact:       make(map[string]*certEntry),
+		wildcard:    make(map[string]*certEntry),
 		logger:      logger,
 	}
 }
@@ -71,36 +87,65 @@ func (m *Manager) Domains() []string {
 	return []string{m.Apex, "*." + m.Apex}
 }
 
-// Ensure loads an existing cert from disk if fresh, otherwise issues a new one.
+// Ensure loads the apex cert from disk if fresh, otherwise issues a new one.
 // Must be called once before serving traffic.
 func (m *Manager) Ensure(ctx context.Context) error {
-	if err := os.MkdirAll(m.certDir(), 0o700); err != nil {
-		return fmt.Errorf("mkdir cert dir: %w", err)
-	}
-	if err := os.MkdirAll(m.accountDir(), 0o700); err != nil {
-		return fmt.Errorf("mkdir account dir: %w", err)
-	}
-
-	if cert, ok, err := m.loadFromDisk(); err != nil {
-		return err
-	} else if ok && expiresIn(cert) > renewBefore {
-		m.logger.Info("loaded existing apex cert from disk",
-			"apex", m.Apex,
-			"expires_in", expiresIn(cert).Round(time.Hour))
-		m.swap(cert)
-		return nil
-	}
-
-	m.logger.Info("issuing apex cert", "apex", m.Apex, "ca", m.CADirURL)
-	cert, err := m.obtain(ctx)
-	if err != nil {
-		return fmt.Errorf("obtain apex cert: %w", err)
-	}
-	m.swap(cert)
-	return nil
+	return m.ensureSANs(ctx, m.Domains(), m.apexBaseName())
 }
 
-// Run blocks, periodically renewing the cert. Returns when ctx is canceled.
+// EnsureName issues (or loads if fresh on disk) a wildcard cert for
+// *.{label}.{Apex}. Idempotent.
+//
+// label is the host portion immediately to the left of Apex — e.g. "test-tunnel"
+// for the per-session hostname "test-tunnel.example.com" (covering ports as
+// "1977.test-tunnel.example.com" etc).
+func (m *Manager) EnsureName(ctx context.Context, label string) error {
+	if label == "" {
+		return errors.New("ensure-name: empty label")
+	}
+	parent := label + "." + m.Apex
+	sans := []string{parent, "*." + parent}
+	return m.ensureSANs(ctx, sans, "_."+parent)
+}
+
+// LoadAllFromDisk walks the cert directory and loads every cert file it finds
+// into the manager. Safe to call repeatedly; certs already loaded are
+// overwritten with the latest disk state. Returns the number of certs loaded.
+func (m *Manager) LoadAllFromDisk() (int, error) {
+	if err := os.MkdirAll(m.certDir(), 0o700); err != nil {
+		return 0, fmt.Errorf("mkdir cert dir: %w", err)
+	}
+	entries, err := os.ReadDir(m.certDir())
+	if err != nil {
+		return 0, fmt.Errorf("read cert dir: %w", err)
+	}
+	n := 0
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasSuffix(name, ".crt") {
+			continue
+		}
+		baseName := strings.TrimSuffix(name, ".crt")
+		cert, ok, err := m.loadCertFile(baseName)
+		if err != nil {
+			m.logger.Warn("skipping cert with load error", "file", name, "err", err)
+			continue
+		}
+		if !ok {
+			continue
+		}
+		sans := dnsNamesFromCert(cert)
+		m.addEntry(&certEntry{cert: cert, sans: sans, baseName: baseName})
+		m.logger.Info("loaded cert from disk",
+			"base", baseName,
+			"sans", sans,
+			"expires_in", expiresIn(cert).Round(time.Hour))
+		n++
+	}
+	return n, nil
+}
+
+// Run blocks, periodically renewing certs. Returns when ctx is canceled.
 func (m *Manager) Run(ctx context.Context) error {
 	t := time.NewTicker(checkEvery)
 	defer t.Stop()
@@ -114,40 +159,109 @@ func (m *Manager) Run(ctx context.Context) error {
 	}
 }
 
-// GetCertificate is a tls.Config.GetCertificate hook.
-func (m *Manager) GetCertificate(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+// GetCertificate is a tls.Config.GetCertificate hook. Picks a cert by SNI:
+// exact-match first, then a one-level wildcard match, then falls back to the
+// apex cert.
+func (m *Manager) GetCertificate(ch *tls.ClientHelloInfo) (*tls.Certificate, error) {
+	sni := normalizeSNI(ch.ServerName)
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	if m.cert == nil {
-		return nil, errors.New("no apex cert loaded")
+
+	if e := m.exact[sni]; e != nil {
+		return e.cert, nil
 	}
-	return m.cert, nil
+	if i := strings.Index(sni, "."); i >= 0 {
+		if e := m.wildcard[sni[i+1:]]; e != nil {
+			return e.cert, nil
+		}
+	}
+	if e := m.exact[m.Apex]; e != nil {
+		return e.cert, nil
+	}
+	if e := m.wildcard[m.Apex]; e != nil {
+		return e.cert, nil
+	}
+	return nil, fmt.Errorf("no certificate for SNI %q", ch.ServerName)
+}
+
+func (m *Manager) ensureSANs(ctx context.Context, sans []string, baseName string) error {
+	if err := os.MkdirAll(m.certDir(), 0o700); err != nil {
+		return fmt.Errorf("mkdir cert dir: %w", err)
+	}
+	if err := os.MkdirAll(m.accountDir(), 0o700); err != nil {
+		return fmt.Errorf("mkdir account dir: %w", err)
+	}
+
+	if cert, ok, err := m.loadCertFile(baseName); err != nil {
+		return err
+	} else if ok && expiresIn(cert) > renewBefore {
+		m.logger.Info("loaded existing cert from disk",
+			"base", baseName,
+			"expires_in", expiresIn(cert).Round(time.Hour))
+		m.addEntry(&certEntry{cert: cert, sans: dnsNamesFromCert(cert), baseName: baseName})
+		return nil
+	}
+
+	m.logger.Info("issuing cert", "sans", sans, "ca", m.CADirURL)
+	cert, err := m.obtain(ctx, sans, baseName)
+	if err != nil {
+		return fmt.Errorf("obtain cert %v: %w", sans, err)
+	}
+	m.addEntry(&certEntry{cert: cert, sans: sans, baseName: baseName})
+	return nil
 }
 
 func (m *Manager) checkAndRenew(ctx context.Context) {
 	m.mu.RLock()
-	current := m.cert
+	snapshot := make([]*certEntry, 0, len(m.entries))
+	for _, e := range m.entries {
+		snapshot = append(snapshot, e)
+	}
 	m.mu.RUnlock()
-	if current == nil {
-		return
+
+	for _, e := range snapshot {
+		if expiresIn(e.cert) > renewBefore {
+			continue
+		}
+		m.logger.Info("renewing cert", "base", e.baseName, "expires_in", expiresIn(e.cert).Round(time.Hour))
+		cert, err := m.obtain(ctx, e.sans, e.baseName)
+		if err != nil {
+			m.logger.Error("renewal failed", "base", e.baseName, "err", err)
+			continue
+		}
+		m.addEntry(&certEntry{cert: cert, sans: e.sans, baseName: e.baseName})
+		m.logger.Info("cert renewed", "base", e.baseName, "expires_in", expiresIn(cert).Round(time.Hour))
 	}
-	if expiresIn(current) > renewBefore {
-		return
-	}
-	m.logger.Info("renewing apex cert", "expires_in", expiresIn(current).Round(time.Hour))
-	cert, err := m.obtain(ctx)
-	if err != nil {
-		m.logger.Error("renewal failed", "err", err)
-		return
-	}
-	m.swap(cert)
-	m.logger.Info("apex cert renewed", "expires_in", expiresIn(cert).Round(time.Hour))
 }
 
-func (m *Manager) swap(cert *tls.Certificate) {
+func (m *Manager) addEntry(e *certEntry) {
 	m.mu.Lock()
-	m.cert = cert
-	m.mu.Unlock()
+	defer m.mu.Unlock()
+	if old, ok := m.entries[e.baseName]; ok {
+		m.removeEntryFromIndexLocked(old)
+	}
+	m.entries[e.baseName] = e
+	for _, name := range dnsNamesFromCert(e.cert) {
+		if strings.HasPrefix(name, "*.") {
+			m.wildcard[name[2:]] = e
+		} else {
+			m.exact[name] = e
+		}
+	}
+}
+
+func (m *Manager) removeEntryFromIndexLocked(e *certEntry) {
+	for _, name := range dnsNamesFromCert(e.cert) {
+		if strings.HasPrefix(name, "*.") {
+			if cur, ok := m.wildcard[name[2:]]; ok && cur == e {
+				delete(m.wildcard, name[2:])
+			}
+		} else {
+			if cur, ok := m.exact[name]; ok && cur == e {
+				delete(m.exact, name)
+			}
+		}
+	}
 }
 
 func (m *Manager) accountDir() string {
@@ -162,15 +276,15 @@ func (m *Manager) certDir() string {
 	return filepath.Join(m.StateDir, "lego", "certificates")
 }
 
-func (m *Manager) certBaseName() string {
+func (m *Manager) apexBaseName() string {
 	return "_." + m.Apex
 }
 
-// loadFromDisk reads the previously-issued cert/key. Returns ok=false if no
-// files exist; an error is returned only on corruption.
-func (m *Manager) loadFromDisk() (*tls.Certificate, bool, error) {
-	crtPath := filepath.Join(m.certDir(), m.certBaseName()+".crt")
-	keyPath := filepath.Join(m.certDir(), m.certBaseName()+".key")
+// loadCertFile reads a cert + key pair by basename. Returns ok=false if no
+// .crt file exists; an error is returned only on corruption or partial state.
+func (m *Manager) loadCertFile(baseName string) (*tls.Certificate, bool, error) {
+	crtPath := filepath.Join(m.certDir(), baseName+".crt")
+	keyPath := filepath.Join(m.certDir(), baseName+".key")
 	crt, err := os.ReadFile(crtPath)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, false, nil
@@ -194,7 +308,7 @@ func (m *Manager) loadFromDisk() (*tls.Certificate, bool, error) {
 	return &cert, true, nil
 }
 
-func (m *Manager) obtain(ctx context.Context) (*tls.Certificate, error) {
+func (m *Manager) obtain(ctx context.Context, sans []string, baseName string) (*tls.Certificate, error) {
 	user, err := m.loadOrCreateUser()
 	if err != nil {
 		return nil, err
@@ -229,14 +343,14 @@ func (m *Manager) obtain(ctx context.Context) (*tls.Certificate, error) {
 	}
 
 	res, err := client.Certificate.Obtain(certificate.ObtainRequest{
-		Domains: m.Domains(),
+		Domains: sans,
 		Bundle:  true,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("obtain: %w", err)
 	}
 
-	if err := m.saveResource(res); err != nil {
+	if err := m.saveResource(res, baseName); err != nil {
 		return nil, fmt.Errorf("save cert: %w", err)
 	}
 
@@ -272,7 +386,6 @@ func (m *Manager) accountFiles() (key, meta string) {
 func (m *Manager) loadOrCreateUser() (*acmeUser, error) {
 	keyPath, metaPath := m.accountFiles()
 
-	// account key
 	var priv crypto.PrivateKey
 	if data, err := os.ReadFile(keyPath); err == nil {
 		block, _ := pem.Decode(data)
@@ -304,7 +417,6 @@ func (m *Manager) loadOrCreateUser() (*acmeUser, error) {
 
 	user := &acmeUser{Email: m.Email, key: priv}
 
-	// registration metadata (optional — present after first registration)
 	if data, err := os.ReadFile(metaPath); err == nil {
 		var u acmeUser
 		if err := json.Unmarshal(data, &u); err != nil {
@@ -329,8 +441,8 @@ func (m *Manager) saveUser(u *acmeUser) error {
 
 // --- cert persistence -----------------------------------------------------
 
-func (m *Manager) saveResource(r *certificate.Resource) error {
-	base := filepath.Join(m.certDir(), m.certBaseName())
+func (m *Manager) saveResource(r *certificate.Resource, baseName string) error {
+	base := filepath.Join(m.certDir(), baseName)
 	files := []struct {
 		path string
 		data []byte
@@ -360,6 +472,25 @@ func expiresIn(c *tls.Certificate) time.Duration {
 		return 0
 	}
 	return time.Until(c.Leaf.NotAfter)
+}
+
+func dnsNamesFromCert(c *tls.Certificate) []string {
+	if c == nil || c.Leaf == nil {
+		return nil
+	}
+	out := make([]string, 0, len(c.Leaf.DNSNames))
+	for _, n := range c.Leaf.DNSNames {
+		out = append(out, strings.ToLower(n))
+	}
+	return out
+}
+
+func normalizeSNI(s string) string {
+	s = strings.TrimSuffix(strings.ToLower(s), ".")
+	if i := strings.Index(s, ":"); i >= 0 {
+		s = s[:i]
+	}
+	return s
 }
 
 // SetStaging configures the manager to use Let's Encrypt's staging environment.

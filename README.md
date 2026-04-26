@@ -6,33 +6,57 @@ See [`docs/design.md`](docs/design.md) for the architecture and protocol.
 
 ## Status
 
-Phase 1 of 6 — apex cert acquisition + hello server. No tunneling yet.
+Phase 2 of 6 — control channel + single-port forward over a single `:443`
+listener. Apex cert lifecycle and hello page from Phase 1 carry over.
 
-## Phase 1: build and run
+## Build and run
 
 ```sh
-go build -o swe-swe-tunneld ./cmd/swe-swe-tunneld
+# server
+go build -o bin/swe-swe-tunneld ./cmd/swe-swe-tunneld
+# client
+go build -o bin/swe-swe-tunnel  ./cmd/swe-swe-tunnel
+```
 
+### Server (one VPS, single port :443)
+
+```sh
 DNSIMPLE_OAUTH_TOKEN=... \
-./swe-swe-tunneld \
+./bin/swe-swe-tunneld \
   --apex-domain=example.com \
   --acme-email=you@example.com \
+  --state-dir=/var/lib/swe-swe-tunnel
+```
+
+On first run it issues `*.example.com` via DNS-01 and persists everything
+under `--state-dir`. On boot it also calls `LoadAllFromDisk()` to pick up any
+per-session wildcards (`_.{label}.{apex}.crt`).
+
+Issue a per-session cert (admin one-shot, exits after issuance):
+
+```sh
+./bin/swe-swe-tunneld --apex-domain=example.com --acme-email=... \
   --state-dir=/var/lib/swe-swe-tunnel \
-  --acme-staging
+  --ensure-cert=test-tunnel
 ```
 
-On first run it generates an ACME account key, registers with Let's Encrypt, runs DNS-01 against DNSimple to issue `*.example.com`, persists everything under `--state-dir`, and serves a hello page on `:443`.
+Restart the server (or wait for a new TLS handshake — `LoadAllFromDisk` is
+also reachable per request via the cert manager) so it picks up the new cert.
 
-Drop `--acme-staging` once you're ready to use the real LE production CA. Staging certs aren't trusted by browsers but don't burn rate-limit budget.
+### Client (on the swe-swe host)
 
+```sh
+./bin/swe-swe-tunnel \
+  --server=https://tunnel.example.com \
+  --unique=test \
+  --target=127.0.0.1
 ```
-$ curl --resolve example.com:443:127.0.0.1 https://example.com/
-swe-swe-tunnel server
-apex: example.com
-phase: 1 (apex cert + hello)
-```
 
-A daily renewal goroutine wakes up, checks expiry, renews any cert <30 days from expiry, and atomically swaps it into the TLS config (no restart, no dropped connections).
+The client dials `POST /v1/connect`, upgrades to yamux, registers as
+`test-tunnel`, and reverse-proxies incoming requests to local TCP services
+keyed on the leftmost label of the request's Host. Once running, browsers can
+hit `https://1977.test-tunnel.example.com/` and reach `127.0.0.1:1977` on the
+swe-swe host.
 
 ## State layout
 
@@ -53,8 +77,9 @@ Compatible with the `lego` CLI's layout — you can inspect or operate on the st
 
 ## Roadmap
 
-- Phase 2: control channel + single-port forward.
+- ~~Phase 1: apex cert + hello~~ ✓
+- ~~Phase 2: control channel + single-port forward~~ ✓
 - Phase 3: registration + identity (proof-of-possession).
-- Phase 4: multi-port + per-session DNS-01.
+- Phase 4: multi-port polish.
 - Phase 5: swe-swe integration. See `/workspace/research/2026-04-26-swe-swe-tunnel-integration.md`.
 - Phase 6: ops polish (metrics, graceful drain, runbook).
