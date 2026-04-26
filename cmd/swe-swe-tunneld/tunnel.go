@@ -19,10 +19,16 @@ import (
 
 	"github.com/hashicorp/yamux"
 
-	"github.com/choonkeat/swe-swe-tunnel/internal/cert"
 	"github.com/choonkeat/swe-swe-tunnel/internal/control"
 	"github.com/choonkeat/swe-swe-tunnel/internal/identity"
+	"github.com/choonkeat/swe-swe-tunnel/internal/ratelimit"
 )
+
+// certEnsurer is the subset of *cert.Manager that connectHandler needs. Kept
+// as an interface so tests can swap in a stub instead of running real ACME.
+type certEnsurer interface {
+	EnsureName(ctx context.Context, label string) error
+}
 
 // maxClockSkew bounds the acceptable distance between client-reported
 // timestamps and server time. Bigger window = easier replay; smaller window =
@@ -77,10 +83,19 @@ func (r *registry) get(label string) *tunnelSession {
 //  1. validate Upgrade headers, hijack, write 101 Switching Protocols
 //  2. yamux.Server, accept stream 1
 //  3. read Register, verify Ed25519 sig + clock skew + unique shape
-//  4. lookup identity store; on first registration, EnsureName issues the
+//  4. apply per-IP and per-pubkey rate limits
+//  5. lookup identity store; on first registration, EnsureName issues the
 //     per-session cert in-line. On reclaim, run Challenge/Proof.
-//  5. send RegisterOK, register session, block until session.Close
-func connectHandler(reg *registry, store *identity.Store, certMgr *cert.Manager, apex string, logger *slog.Logger) http.Handler {
+//  6. send RegisterOK, register session, block until session.Close
+func connectHandler(
+	reg *registry,
+	store *identity.Store,
+	certMgr certEnsurer,
+	apex string,
+	ipLimiter *ratelimit.SlidingWindow,
+	pubkeyLimiter *ratelimit.SlidingWindow,
+	logger *slog.Logger,
+) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "POST required", http.StatusMethodNotAllowed)
@@ -134,7 +149,7 @@ func connectHandler(reg *registry, store *identity.Store, certMgr *cert.Manager,
 		}
 
 		ctx := r.Context()
-		regResult, ok := handleRegister(ctx, stream, store, certMgr, logger, conn.RemoteAddr().String())
+		regResult, ok := handleRegister(ctx, stream, store, certMgr, ipLimiter, pubkeyLimiter, logger, conn.RemoteAddr().String())
 		if !ok {
 			return
 		}
@@ -177,7 +192,9 @@ func handleRegister(
 	ctx context.Context,
 	stream io.ReadWriter,
 	store *identity.Store,
-	certMgr *cert.Manager,
+	certMgr certEnsurer,
+	ipLimiter *ratelimit.SlidingWindow,
+	pubkeyLimiter *ratelimit.SlidingWindow,
 	logger *slog.Logger,
 	remoteAddr string,
 ) (registerResult, bool) {
@@ -204,6 +221,18 @@ func handleRegister(
 		return registerResult{}, false
 	}
 
+	// Per-IP rate limit (cheap; check before crypto). The remoteAddr from
+	// http.Server is host:port, so split.
+	ipKey := remoteAddr
+	if h, _, err := net.SplitHostPort(remoteAddr); err == nil {
+		ipKey = h
+	}
+	if ipLimiter != nil && !ipLimiter.Allow(ipKey) {
+		logger.Warn("register denied: ip rate limit", "remote", remoteAddr, "unique", reg.Unique)
+		sendDeny(stream, "rate_limited:ip")
+		return registerResult{}, false
+	}
+
 	pub, err := base64.RawStdEncoding.DecodeString(reg.Pubkey)
 	if err != nil || len(pub) != ed25519.PublicKeySize {
 		sendDeny(stream, "bad pubkey")
@@ -224,6 +253,14 @@ func handleRegister(
 
 	if !ed25519.Verify(pub, control.RegisterSigningPayload(pub, reg.Unique, reg.Timestamp), sig) {
 		sendDeny(stream, "signature invalid")
+		return registerResult{}, false
+	}
+
+	// Per-pubkey rate limit (sig is verified now, so the pubkey claim is
+	// honest). Cap how many distinct uniques one keypair can register/day.
+	if pubkeyLimiter != nil && !pubkeyLimiter.Allow(string(pub)) {
+		logger.Warn("register denied: pubkey rate limit", "remote", remoteAddr, "unique", reg.Unique)
+		sendDeny(stream, "rate_limited:pubkey")
 		return registerResult{}, false
 	}
 

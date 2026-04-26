@@ -24,17 +24,20 @@ import (
 
 	"github.com/choonkeat/swe-swe-tunnel/internal/cert"
 	"github.com/choonkeat/swe-swe-tunnel/internal/identity"
+	"github.com/choonkeat/swe-swe-tunnel/internal/ratelimit"
 )
 
 func main() {
 	var (
-		listen      = flag.String("listen", ":443", "HTTPS listener address")
-		apex        = flag.String("apex-domain", "", "DNS apex (required), e.g. example.com")
-		email       = flag.String("acme-email", "", "ACME account email (required)")
-		stateDir    = flag.String("state-dir", defaultStateDir(), "persistent state directory")
-		dnsProv     = flag.String("dns-provider", "dnsimple", "lego DNS provider")
-		staging     = flag.Bool("acme-staging", false, "use Let's Encrypt staging (untrusted, no rate limits)")
-		ensureCert  = flag.String("ensure-cert", "", "issue *.{label}.{apex} cert and exit (admin one-shot)")
+		listen           = flag.String("listen", ":443", "HTTPS listener address")
+		apex             = flag.String("apex-domain", "", "DNS apex (required), e.g. example.com")
+		email            = flag.String("acme-email", "", "ACME account email (required)")
+		stateDir         = flag.String("state-dir", defaultStateDir(), "persistent state directory")
+		dnsProv          = flag.String("dns-provider", "dnsimple", "lego DNS provider")
+		staging          = flag.Bool("acme-staging", false, "use Let's Encrypt staging (untrusted, no rate limits)")
+		ensureCert       = flag.String("ensure-cert", "", "issue *.{label}.{apex} cert and exit (admin one-shot)")
+		registerIPLimit  = flag.Int("register-rate-ip-per-hour", 5, "max REGISTER attempts per source IP per hour (0 = disabled)")
+		registerKeyLimit = flag.Int("register-rate-pubkey-per-day", 10, "max REGISTER attempts per pubkey per day (0 = disabled)")
 	)
 	flag.Parse()
 
@@ -100,10 +103,17 @@ func main() {
 	}
 	defer idStore.Close()
 
+	ipLim := ratelimit.New(*registerIPLimit, time.Hour)
+	keyLim := ratelimit.New(*registerKeyLimit, 24*time.Hour)
+	logger.Info("register rate limits",
+		"ip_per_hour", *registerIPLimit,
+		"pubkey_per_day", *registerKeyLimit,
+	)
+
 	reg := newRegistry()
 
 	mux := http.NewServeMux()
-	mux.Handle("/v1/connect", connectHandler(reg, idStore, mgr, *apex, logger))
+	mux.Handle("/v1/connect", connectHandler(reg, idStore, mgr, *apex, ipLim, keyLim, logger))
 	mux.Handle("/", route(reg, *apex, helloHandler(*apex)))
 
 	srv := &http.Server{
