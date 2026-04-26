@@ -51,9 +51,11 @@ type Options struct {
 
 // Session is the established post-Register tunnel.
 type Session struct {
-	yamux    *yamux.Session
-	hostname string
-	conn     net.Conn // TLS conn underlying the yamux session; closed on Close
+	yamux        *yamux.Session
+	hostname     string
+	unique       string    // bare label sent in Register (without the "-tunnel" suffix)
+	registeredAt time.Time // captured when RegisterOK arrives
+	conn         net.Conn  // TLS conn underlying the yamux session; closed on Close
 }
 
 // Hostname returns the server-assigned hostname, e.g. "alpha-tunnel.example.com".
@@ -180,7 +182,13 @@ func Connect(ctx context.Context, opts Options) (*Session, error) {
 	}
 	logger.Info("registered", "hostname", hostname)
 
-	return &Session{yamux: yam, hostname: hostname, conn: tlsConn}, nil
+	return &Session{
+		yamux:        yam,
+		hostname:     hostname,
+		unique:       opts.Unique,
+		registeredAt: time.Now(),
+		conn:         tlsConn,
+	}, nil
 }
 
 // Serve runs an http.Server on the yamux session's accept side, dispatching
