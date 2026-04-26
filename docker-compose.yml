@@ -12,8 +12,10 @@ services:
       DNSIMPLE_OAUTH_TOKEN: ${DNSIMPLE_OAUTH_TOKEN:?required}
       SWE_TUNNEL_APEX: ${SWE_TUNNEL_APEX:?required}
       SWE_TUNNEL_ACME_EMAIL: ${SWE_TUNNEL_ACME_EMAIL:?required}
+      # Set via env (not command:) so it also covers `compose run` invocations
+      # that override the entrypoint args (e.g. --ensure-cert).
+      SWE_TUNNEL_STATE: /var/lib/swe-swe-tunnel
     command:
-      - --state-dir=/var/lib/swe-swe-tunnel
       - --listen=:443
 
 volumes:
