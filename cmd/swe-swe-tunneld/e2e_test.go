@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -16,6 +17,7 @@ import (
 	"net/http/httptest"
 	"net/http/httputil"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -493,6 +495,71 @@ func TestE2E_SessionCloseRemovesFromRegistry(t *testing.T) {
 
 	if !waitFor(t, 2*time.Second, func() bool { return s.registry.get("epsilon-tunnel") == nil }) {
 		t.Error("registry still has session after close")
+	}
+}
+
+// --------------------------------------------------------------------------
+// State-file fallback: WriteState produces the documented JSON shape after
+// a real RegisterOK. This is the producer side of Phase 5 step 4 — the
+// consumer (swe-swe's public-hostname resolver) reads this file when env
+// and flag aren't set.
+// --------------------------------------------------------------------------
+
+func TestE2E_WriteStateAfterConnect(t *testing.T) {
+	s := newE2ESuite(t)
+
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sess, err := s.dialAndRegister(ctx, "stateful", priv)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer sess.Close()
+
+	// Path under a non-existent subdir to also exercise parent-dir creation
+	// against a real Session (not just the synthetic Session used by
+	// state_test.go).
+	statePath := filepath.Join(t.TempDir(), "nested", "tunnel-state.json")
+	if err := tunnelclient.WriteState(statePath, sess); err != nil {
+		t.Fatalf("WriteState: %v", err)
+	}
+
+	info, err := os.Stat(statePath)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if mode := info.Mode().Perm(); mode != 0o600 {
+		t.Errorf("file mode = %o, want 0600", mode)
+	}
+
+	raw, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	var got tunnelclient.State
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	wantHost := "stateful-tunnel." + s.apex
+	if got.Hostname != wantHost {
+		t.Errorf("Hostname = %q, want %q", got.Hostname, wantHost)
+	}
+	if got.Unique != "stateful" {
+		t.Errorf("Unique = %q, want stateful", got.Unique)
+	}
+	// RegisteredAt is RFC3339 / no nanoseconds; just confirm it parses and
+	// is recent (within the last minute).
+	parsedTs, err := time.Parse(time.RFC3339, got.RegisteredAt)
+	if err != nil {
+		t.Fatalf("RegisteredAt %q is not RFC3339: %v", got.RegisteredAt, err)
+	}
+	if since := time.Since(parsedTs); since < 0 || since > time.Minute {
+		t.Errorf("RegisteredAt = %v, expected within the last minute", parsedTs)
 	}
 }
 
