@@ -193,7 +193,16 @@ func proxyHandler(target string, logger *slog.Logger) http.Handler {
 			req.Out.URL.Scheme = "http"
 			req.Out.URL.Host = net.JoinHostPort(target, port)
 			req.Out.Host = req.In.Host
-			req.SetXForwarded()
+			// Pass the public-facing tunneld's X-Forwarded-* headers through
+			// unchanged. Rewrite strips them by default, and SetXForwarded
+			// would derive new values from the yamux hop (which has no TLS
+			// state and a non-host:port RemoteAddr) — we'd lose the real
+			// browser IP and "https" proto.
+			for _, h := range []string{"X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto"} {
+				if v := req.In.Header.Get(h); v != "" {
+					req.Out.Header.Set(h, v)
+				}
+			}
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			if errors.Is(err, context.Canceled) {
