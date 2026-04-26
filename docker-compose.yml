@@ -15,8 +15,6 @@ services:
     command:
       - --state-dir=/var/lib/swe-swe-tunnel
       - --listen=:443
-      # remove --acme-staging once you're ready for a browser-trusted cert
-      - --acme-staging
 
 volumes:
   tunnel-data:
