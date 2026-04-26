@@ -3,3 +3,4 @@
 !.env.example
 *.test
 /swe-swe-tunneld
+.swe-swe/
