@@ -177,6 +177,9 @@ func TestHandleRegister_FreshRegistration(t *testing.T) {
 	if !res.res.newRegistration {
 		t.Error("expected newRegistration=true on first register")
 	}
+	if !bytes.Equal(res.res.pubkey, priv.Public().(ed25519.PublicKey)) {
+		t.Error("registerResult.pubkey not set to the connecting client's pubkey")
+	}
 	if got := h.ensurer.Calls(); len(got) != 1 || got[0] != "alpha-tunnel" {
 		t.Errorf("ensurer calls = %v, want [alpha-tunnel]", got)
 	}

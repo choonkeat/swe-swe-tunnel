@@ -43,12 +43,13 @@ const (
 type Kind string
 
 const (
-	KindRegister   Kind = "register"
-	KindRegisterOK Kind = "register_ok"
-	KindChallenge  Kind = "challenge"
-	KindProof      Kind = "proof"
-	KindDeny       Kind = "deny"
-	KindDeregister Kind = "deregister"
+	KindRegister     Kind = "register"
+	KindRegisterOK   Kind = "register_ok"
+	KindChallenge    Kind = "challenge"
+	KindProof        Kind = "proof"
+	KindDeny         Kind = "deny"
+	KindDeregister   Kind = "deregister"
+	KindDeregisterOK Kind = "deregister_ok"
 )
 
 // Frame is the typed envelope on stream 1.
@@ -97,6 +98,10 @@ type Deregister struct {
 	Timestamp int64  `json:"timestamp"`
 	Sig       string `json:"sig"`
 }
+
+// DeregisterOK is the server's terminal "row deleted" reply to Deregister.
+// Empty struct: presence of the frame on the wire IS the success signal.
+type DeregisterOK struct{}
 
 // Domain separators prevent cross-protocol signature reuse. Format:
 // "<package>/<purpose>/v<n>\n" + canonical fields.

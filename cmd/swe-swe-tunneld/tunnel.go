@@ -174,8 +174,18 @@ func connectHandler(
 			"new_registration", regResult.newRegistration,
 		)
 
+		// Run the post-RegisterOK control loop. Returns when the client hangs
+		// up the control stream OR when a successful Deregister has been
+		// processed (in which case we tear down the session).
+		deregistered := runControlLoop(ctx, stream, store, regResult.unique, regResult.pubkey, logger)
+		if deregistered {
+			_ = sess.Close()
+		}
 		<-sess.CloseChan()
-		logger.Info("tunnel disconnected", "label", regResult.label)
+		logger.Info("tunnel disconnected",
+			"label", regResult.label,
+			"deregistered", deregistered,
+		)
 	})
 }
 
@@ -183,6 +193,12 @@ type registerResult struct {
 	unique          string
 	label           string
 	newRegistration bool
+	// pubkey is the Ed25519 key the session is authenticated as. After a
+	// Challenge/Proof+Rotate flow this is the *new* key; on idempotent
+	// reconnect it equals the stored key. The control loop uses it to
+	// verify post-RegisterOK frames (e.g. Deregister) without re-reading
+	// the store on every frame.
+	pubkey ed25519.PublicKey
 }
 
 // handleRegister reads the Register frame, validates it, runs identity lookup
@@ -282,7 +298,7 @@ func handleRegister(
 			sendDeny(stream, "store error")
 			return registerResult{}, false
 		}
-		return registerResult{unique: reg.Unique, label: label, newRegistration: true}, true
+		return registerResult{unique: reg.Unique, label: label, newRegistration: true, pubkey: pub}, true
 
 	case err != nil:
 		logger.Error("identity get failed", "unique", reg.Unique, "err", err)
@@ -293,7 +309,7 @@ func handleRegister(
 	// Existing entry — pubkey match → idempotent reconnect.
 	if bytes.Equal(existing.Pubkey, pub) {
 		_ = store.Touch(ctx, reg.Unique, now)
-		return registerResult{unique: reg.Unique, label: label, newRegistration: false}, true
+		return registerResult{unique: reg.Unique, label: label, newRegistration: false, pubkey: pub}, true
 	}
 
 	// Existing entry, different pubkey → challenge & require proof from the
@@ -341,11 +357,111 @@ func handleRegister(
 		return registerResult{}, false
 	}
 	logger.Info("identity key rotated", "unique", reg.Unique, "remote", remoteAddr)
-	return registerResult{unique: reg.Unique, label: label, newRegistration: false}, true
+	return registerResult{unique: reg.Unique, label: label, newRegistration: false, pubkey: pub}, true
 }
 
 func sendDeny(w io.Writer, reason string) {
 	_ = control.WriteMessage(w, control.KindDeny, control.Deny{Reason: reason})
+}
+
+// runControlLoop dispatches inbound control frames after RegisterOK.
+// Returns true iff a successful Deregister has been processed (in which
+// case the caller should close the yamux session). Returns false on EOF /
+// session shutdown / peer hangup, which is the normal disconnect path.
+//
+// Non-Deregister frames receive a Deny but the loop continues, so a
+// confused peer can't unilaterally tear us down by sending stray frames.
+func runControlLoop(
+	ctx context.Context,
+	stream io.ReadWriter,
+	store *identity.Store,
+	sessUnique string,
+	sessPubkey ed25519.PublicKey,
+	logger *slog.Logger,
+) (deregistered bool) {
+	for {
+		frame, err := control.ReadFrame(stream)
+		if err != nil {
+			// EOF / yamux shutdown / etc. — peer closed the control stream.
+			// This is the dominant disconnect path.
+			return false
+		}
+		if frame.Type == control.KindDeregister {
+			if handleDeregister(ctx, stream, frame, store, sessUnique, sessPubkey, logger) {
+				return true
+			}
+			// Validation failed → Deny was already sent; keep listening.
+			continue
+		}
+		sendDeny(stream, fmt.Sprintf("unexpected post-register frame %q", frame.Type))
+	}
+}
+
+// handleDeregister validates a Deregister frame and, on success, deletes
+// the identity row + writes DeregisterOK. Returns true on success.
+//
+// Validation chain (any failure → Deny + return false, session preserved):
+//  1. Payload decodes.
+//  2. Claimed unique matches the unique this session is authenticated as.
+//     Defense-in-depth: even with a sig-verify bug elsewhere, you cannot
+//     deregister a name other than the one you registered as.
+//  3. Timestamp within ±maxClockSkew of server time (replay window).
+//  4. Sig is well-formed and verifies against the *session's* authenticated
+//     pubkey via DeregisterSigningPayload (domain-separated from Register
+//     and Proof).
+func handleDeregister(
+	ctx context.Context,
+	stream io.Writer,
+	frame control.Frame,
+	store *identity.Store,
+	sessUnique string,
+	sessPubkey ed25519.PublicKey,
+	logger *slog.Logger,
+) (success bool) {
+	var d control.Deregister
+	if err := control.DecodePayload(frame, &d); err != nil {
+		sendDeny(stream, "bad deregister payload")
+		return false
+	}
+
+	if d.Unique != sessUnique {
+		logger.Warn("deregister denied: unique mismatch",
+			"session_unique", sessUnique, "claimed_unique", d.Unique)
+		sendDeny(stream, "unique mismatch")
+		return false
+	}
+
+	now := time.Now().UTC()
+	ts := time.Unix(d.Timestamp, 0).UTC()
+	if delta := now.Sub(ts); delta > maxClockSkew || -delta > maxClockSkew {
+		sendDeny(stream, "timestamp out of range")
+		return false
+	}
+
+	sig, err := base64.RawStdEncoding.DecodeString(d.Sig)
+	if err != nil || len(sig) != ed25519.SignatureSize {
+		sendDeny(stream, "bad sig")
+		return false
+	}
+	if !ed25519.Verify(sessPubkey, control.DeregisterSigningPayload(d.Unique, d.Timestamp), sig) {
+		logger.Warn("deregister denied: signature invalid", "unique", d.Unique)
+		sendDeny(stream, "signature invalid")
+		return false
+	}
+
+	if err := store.Delete(ctx, d.Unique); err != nil {
+		logger.Error("deregister: store.Delete failed", "unique", d.Unique, "err", err)
+		sendDeny(stream, "store error")
+		return false
+	}
+	if err := control.WriteMessage(stream, control.KindDeregisterOK, control.DeregisterOK{}); err != nil {
+		// Row is already gone. The client may not learn about success on
+		// this attempt; a retry will Deny "not registered" or land on a
+		// fresh registration. Either way, the row release stuck.
+		logger.Warn("write DeregisterOK failed", "unique", d.Unique, "err", err)
+	}
+	logger.Info("identity deregistered", "unique", d.Unique)
+	return true
 }
 
 // route returns the catch-all http.Handler. r.Host matching

@@ -110,3 +110,59 @@ func TestProofSigningInputDistinct(t *testing.T) {
 		t.Error("Register sig should not satisfy Proof verification — domain separators must differ")
 	}
 }
+
+func TestDeregisterSigningInputDistinct(t *testing.T) {
+	// A Deregister payload must not be satisfiable by a Register or Proof
+	// signature even when the underlying fields collide. Domain separators
+	// guarantee this.
+	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
+	const unique = "abc"
+	const ts = int64(42)
+
+	deregPayload := DeregisterSigningPayload(unique, ts)
+	deregSig := ed25519.Sign(priv, deregPayload)
+	if !ed25519.Verify(pub, deregPayload, deregSig) {
+		t.Fatal("self-verify failed")
+	}
+
+	// Register sig over the same fields must not satisfy Deregister.
+	regSig := ed25519.Sign(priv, RegisterSigningPayload(pub, unique, ts))
+	if ed25519.Verify(pub, deregPayload, regSig) {
+		t.Error("Register sig should not satisfy Deregister verification")
+	}
+	// And vice versa.
+	if ed25519.Verify(pub, RegisterSigningPayload(pub, unique, ts), deregSig) {
+		t.Error("Deregister sig should not satisfy Register verification")
+	}
+	// Proof sig (whose payload is just nonce-bytes) shouldn't satisfy either.
+	proofSig := ed25519.Sign(priv, ProofSigningPayload([]byte("any 32 bytes here ........... abc")))
+	if ed25519.Verify(pub, deregPayload, proofSig) {
+		t.Error("Proof sig should not satisfy Deregister verification")
+	}
+
+	// Sanity: changing any field invalidates a Deregister sig.
+	if ed25519.Verify(pub, DeregisterSigningPayload("abd", ts), deregSig) {
+		t.Error("Deregister sig should not verify for a different unique")
+	}
+	if ed25519.Verify(pub, DeregisterSigningPayload(unique, ts+1), deregSig) {
+		t.Error("Deregister sig should not verify for a different timestamp")
+	}
+}
+
+func TestDeregisterOKRoundTrip(t *testing.T) {
+	var buf bytes.Buffer
+	if err := WriteMessage(&buf, KindDeregisterOK, DeregisterOK{}); err != nil {
+		t.Fatalf("WriteMessage: %v", err)
+	}
+	f, err := ReadFrame(&buf)
+	if err != nil {
+		t.Fatalf("ReadFrame: %v", err)
+	}
+	if f.Type != KindDeregisterOK {
+		t.Errorf("Type = %q, want %q", f.Type, KindDeregisterOK)
+	}
+	var out DeregisterOK
+	if err := DecodePayload(f, &out); err != nil {
+		t.Fatalf("DecodePayload: %v", err)
+	}
+}
