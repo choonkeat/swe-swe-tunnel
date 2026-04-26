@@ -53,9 +53,11 @@ type Options struct {
 type Session struct {
 	yamux        *yamux.Session
 	hostname     string
-	unique       string    // bare label sent in Register (without the "-tunnel" suffix)
-	registeredAt time.Time // captured when RegisterOK arrives
-	conn         net.Conn  // TLS conn underlying the yamux session; closed on Close
+	unique       string             // bare label sent in Register (without the "-tunnel" suffix)
+	registeredAt time.Time          // captured when RegisterOK arrives
+	priv         ed25519.PrivateKey // retained so Deregister can sign the request
+	ctrl         *yamux.Stream      // stream-1 control channel; reused for post-RegisterOK frames
+	conn         net.Conn           // TLS conn underlying the yamux session; closed on Close
 }
 
 // Hostname returns the server-assigned hostname, e.g. "alpha-tunnel.example.com".
@@ -187,8 +189,68 @@ func Connect(ctx context.Context, opts Options) (*Session, error) {
 		hostname:     hostname,
 		unique:       opts.Unique,
 		registeredAt: time.Now(),
+		priv:         opts.PrivateKey,
+		ctrl:         stream,
 		conn:         tlsConn,
 	}, nil
+}
+
+// Deregister releases ownership of this session's unique on the server.
+// The server validates a signed Deregister frame, deletes the identity
+// row, replies with DeregisterOK, and closes the session.
+//
+// On success the caller should call Close(); after a successful
+// Deregister the next Register from any pubkey will be a fresh
+// registration (no Challenge required, since the row is gone).
+//
+// On a server-side Deny (rare — usually means the session lost auth
+// somehow) the error wraps the Deny.Reason. On any other failure
+// (network, malformed reply) the session may be in an indeterminate
+// state and should be closed regardless.
+func (s *Session) Deregister(ctx context.Context) error {
+	if s.priv == nil || s.ctrl == nil {
+		return errors.New("tunnelclient: session is not Deregister-capable (was it built outside Connect?)")
+	}
+
+	ts := time.Now().Unix()
+	sig := ed25519.Sign(s.priv, control.DeregisterSigningPayload(s.unique, ts))
+	if err := control.WriteMessage(s.ctrl, control.KindDeregister, control.Deregister{
+		Unique:    s.unique,
+		Timestamp: ts,
+		Sig:       base64.RawStdEncoding.EncodeToString(sig),
+	}); err != nil {
+		return fmt.Errorf("write Deregister: %w", err)
+	}
+
+	// Translate ctx cancellation into a forced read deadline so the read
+	// returns instead of blocking forever.
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = s.ctrl.SetReadDeadline(time.Now())
+		case <-done:
+		}
+	}()
+
+	frame, err := control.ReadFrame(s.ctrl)
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return fmt.Errorf("read Deregister response: %w", ctxErr)
+		}
+		return fmt.Errorf("read Deregister response: %w", err)
+	}
+	switch frame.Type {
+	case control.KindDeregisterOK:
+		return nil
+	case control.KindDeny:
+		var d control.Deny
+		_ = control.DecodePayload(frame, &d)
+		return fmt.Errorf("server denied deregister: %s", d.Reason)
+	default:
+		return fmt.Errorf("unexpected frame %q in Deregister response", frame.Type)
+	}
 }
 
 // Serve runs an http.Server on the yamux session's accept side, dispatching
