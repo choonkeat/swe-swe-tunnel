@@ -90,6 +90,12 @@ func main() {
 		logger.Info("loaded certs from disk", "count", n)
 	}
 
+	// Boot-time DNS sanity check. Doesn't block startup; just surfaces a
+	// loud WARN if the apex's authoritative DNS doesn't return a wildcard
+	// for multi-label names — the property documented in
+	// docs/adr/0001-dns-host-multi-label-wildcards.md.
+	cert.ProbeWildcard(ctx, *apex, cert.DefaultLookup, logger)
+
 	go func() {
 		if err := mgr.Run(ctx); err != nil && ctx.Err() == nil {
 			logger.Error("cert renewal loop exited", "err", err)
