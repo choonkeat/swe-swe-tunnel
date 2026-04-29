@@ -121,34 +121,44 @@ func Run(ctx context.Context, ro RunOptions) error {
 			}
 		}
 
-		serveErr := Serve(ctx, sess, ro.Handler)
+		// Serve runs in a child context so we can stop it AFTER a
+		// graceful Deregister round-trip. Serve's httpSrv.Shutdown
+		// closes the yamux listener, which closes the session — that
+		// would kill the control stream Deregister needs. So when the
+		// outer ctx cancels, we Deregister first, then cancel serveCtx.
+		serveCtx, cancelServe := context.WithCancel(context.Background())
+		serveDone := make(chan error, 1)
+		go func() { serveDone <- Serve(serveCtx, sess, ro.Handler) }()
 
-		if ctx.Err() != nil {
-			// Graceful path: the parent signaled shutdown. Try to
-			// Deregister with a fresh context, emitting deregister_ok on
-			// success. SIGKILL never reaches us, so this branch only
-			// runs on SIGTERM/SIGINT.
-			derCtx, cancel := context.WithTimeout(context.Background(), deregTimeout)
-			derErr := sess.Deregister(derCtx)
-			cancel()
-			if derErr != nil {
+		select {
+		case <-ctx.Done():
+			// Graceful: deregister with the control stream still alive.
+			// SIGKILL never reaches us, so this branch only runs on
+			// SIGTERM/SIGINT.
+			derCtx, derCancel := context.WithTimeout(context.Background(), deregTimeout)
+			if err := sess.Deregister(derCtx); err != nil {
 				em.Emit(EventError, ErrorData{
-					Message:   "deregister: " + derErr.Error(),
+					Message:   "deregister: " + err.Error(),
 					Retryable: false,
 				})
 			}
+			derCancel()
+			cancelServe()
+			<-serveDone
 			_ = sess.Close()
 			return nil
-		}
 
-		// Session ended without ctx cancellation: this is an unexpected
-		// disconnect. Surface it and reconnect.
-		reason := "session closed"
-		if serveErr != nil {
-			reason = serveErr.Error()
+		case serveErr := <-serveDone:
+			// Session ended without ctx cancellation: unexpected
+			// disconnect. Surface it and reconnect.
+			cancelServe()
+			reason := "session closed"
+			if serveErr != nil {
+				reason = serveErr.Error()
+			}
+			em.Emit(EventDisconnected, DisconnectedData{Reason: reason})
+			_ = sess.Close()
 		}
-		em.Emit(EventDisconnected, DisconnectedData{Reason: reason})
-		_ = sess.Close()
 
 		delay := backoffDuration(attempt, backoffMin, backoffMax)
 		attempt++
