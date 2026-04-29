@@ -6,181 +6,27 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
-	"crypto/tls"
-	"crypto/x509"
 	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
-	"net/http/httptest"
-	"net/url"
-	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/hashicorp/yamux"
-
-	"github.com/choonkeat/swe-swe-tunnel/internal/control"
+	"github.com/choonkeat/swe-swe-tunnel/internal/tunneldfake"
 )
 
-// fakeTunneld is a hand-rolled minimal server that handles the /v1/connect
-// HTTP-Upgrade handshake, runs yamux, accepts stream 1, and replies with
-// RegisterOK. It does NOT implement Challenge/Proof — the test harness
-// always uses a fresh key per `unique`. After RegisterOK, it can be told
-// to close the session (drop the underlying TCP conn), or to read a
-// Deregister frame and reply with DeregisterOK.
-type fakeTunneld struct {
-	t        *testing.T
-	server   *httptest.Server
-	logger   *slog.Logger
-	apex     string
-	tlsCfg   *tls.Config
-	registers atomic.Int32 // count of successful Register frames seen
-	mu        sync.Mutex
-	// killAfter, when non-zero, makes the Nth registration (1-indexed)
-	// close the conn immediately after sending RegisterOK. After that the
-	// next registration succeeds normally.
-	killAfter int
-}
-
-func newFakeTunneld(t *testing.T) *fakeTunneld {
+// newFakeTunneld is a thin wrapper around tunneldfake.Start that ties
+// the fake's lifetime to the test and routes diagnostic logs to t.Logf.
+func newFakeTunneld(t *testing.T) *tunneldfake.Server {
 	t.Helper()
-	f := &fakeTunneld{
-		t:      t,
-		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
-		apex:   "tunnel.test",
-	}
-	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/connect", f.handleConnect)
-	srv := httptest.NewTLSServer(mux)
-	t.Cleanup(srv.Close)
-	f.server = srv
-
-	roots := x509.NewCertPool()
-	roots.AddCert(srv.Certificate())
-	u, err := url.Parse(srv.URL)
+	f, err := tunneldfake.Start(tunneldfake.Options{Logf: t.Logf})
 	if err != nil {
 		t.Fatal(err)
 	}
-	f.tlsCfg = &tls.Config{
-		RootCAs:    roots,
-		ServerName: u.Hostname(),
-		MinVersion: tls.VersionTLS12,
-	}
+	t.Cleanup(f.Close)
 	return f
-}
-
-// killNextSession arms the fake to drop the TCP conn immediately after
-// the next RegisterOK. Used for the crash+reconnect test.
-func (f *fakeTunneld) killNextSession() {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.killAfter = int(f.registers.Load()) + 1
-}
-
-func (f *fakeTunneld) handleConnect(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method", http.StatusMethodNotAllowed)
-		return
-	}
-	if !strings.EqualFold(r.Header.Get("Upgrade"), control.UpgradeProtocol) {
-		http.Error(w, "upgrade", http.StatusBadRequest)
-		return
-	}
-	hijacker, ok := w.(http.Hijacker)
-	if !ok {
-		http.Error(w, "no hijack", http.StatusInternalServerError)
-		return
-	}
-	conn, brw, err := hijacker.Hijack()
-	if err != nil {
-		http.Error(w, "hijack: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-	// Reply 101 Switching Protocols.
-	resp := "HTTP/1.1 101 Switching Protocols\r\n" +
-		"Upgrade: " + control.UpgradeProtocol + "\r\n" +
-		"Connection: Upgrade\r\n\r\n"
-	if _, err := brw.WriteString(resp); err != nil {
-		f.t.Logf("fake tunneld: write 101: %v", err)
-		_ = conn.Close()
-		return
-	}
-	if err := brw.Flush(); err != nil {
-		f.t.Logf("fake tunneld: flush 101: %v", err)
-		_ = conn.Close()
-		return
-	}
-
-	yam, err := yamux.Server(conn, nil)
-	if err != nil {
-		f.t.Logf("fake tunneld: yamux server: %v", err)
-		_ = conn.Close()
-		return
-	}
-	defer yam.Close()
-
-	stream, err := yam.AcceptStream()
-	if err != nil {
-		f.t.Logf("fake tunneld: accept stream: %v", err)
-		return
-	}
-
-	frame, err := control.ReadFrame(stream)
-	if err != nil {
-		f.t.Logf("fake tunneld: read register: %v", err)
-		return
-	}
-	if frame.Type != control.KindRegister {
-		f.t.Logf("fake tunneld: want Register, got %q", frame.Type)
-		return
-	}
-	var reg control.Register
-	if err := control.DecodePayload(frame, &reg); err != nil {
-		f.t.Logf("fake tunneld: decode register: %v", err)
-		return
-	}
-	hostname := control.TunnelLabel(reg.Unique) + "." + f.apex
-	if err := control.WriteMessage(stream, control.KindRegisterOK, control.RegisterOK{
-		Hostname: hostname,
-	}); err != nil {
-		f.t.Logf("fake tunneld: write register_ok: %v", err)
-		return
-	}
-
-	registered := f.registers.Add(1)
-
-	f.mu.Lock()
-	shouldKill := f.killAfter != 0 && int(registered) == f.killAfter
-	f.mu.Unlock()
-	if shouldKill {
-		// Drop the underlying TCP conn so the client's yamux session dies.
-		// The client's Run loop will see Serve return without ctx
-		// cancellation, emit `disconnected`, and reconnect.
-		_ = conn.Close()
-		return
-	}
-
-	// Continue: read further frames on the control stream (e.g.
-	// Deregister) until the session ends.
-	for {
-		fr, err := control.ReadFrame(stream)
-		if err != nil {
-			return
-		}
-		switch fr.Type {
-		case control.KindDeregister:
-			if err := control.WriteMessage(stream, control.KindDeregisterOK, control.DeregisterOK{}); err != nil {
-				f.t.Logf("fake tunneld: write deregister_ok: %v", err)
-			}
-			// Server-side: tear down after deregister.
-			return
-		default:
-			// Ignore other frames in the fake.
-		}
-	}
 }
 
 // captureBuffer is a thread-safe bytes.Buffer for the JSONL emitter to
@@ -275,11 +121,11 @@ func TestE2E_Run_HappyPath_JSONL(t *testing.T) {
 	go func() {
 		runDone <- Run(ctx, RunOptions{
 			Connect: Options{
-				ServerURL:  f.server.URL,
+				ServerURL:  f.URL(),
 				Unique:     "happy",
 				PrivateKey: freshKey(t),
-				TLSConfig:  f.tlsCfg,
-				Logger:     f.logger,
+				TLSConfig:  f.TLSConfig(),
+				Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
 				Emitter:    em,
 			},
 			Handler:    http.NotFoundHandler(),
@@ -314,7 +160,7 @@ func TestE2E_Run_HappyPath_JSONL(t *testing.T) {
 // second register_ok on the same line stream.
 func TestE2E_Run_CrashAndReconnect_JSONL(t *testing.T) {
 	f := newFakeTunneld(t)
-	f.killNextSession() // first registration gets dropped right after RegisterOK
+	f.KillNextSession() // first registration gets dropped right after RegisterOK
 
 	cap := &captureBuffer{}
 	em := NewJSONLEmitter(cap)
@@ -326,11 +172,11 @@ func TestE2E_Run_CrashAndReconnect_JSONL(t *testing.T) {
 	go func() {
 		runDone <- Run(ctx, RunOptions{
 			Connect: Options{
-				ServerURL:  f.server.URL,
+				ServerURL:  f.URL(),
 				Unique:     "crashy",
 				PrivateKey: freshKey(t),
-				TLSConfig:  f.tlsCfg,
-				Logger:     f.logger,
+				TLSConfig:  f.TLSConfig(),
+				Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
 				Emitter:    em,
 			},
 			Handler:    http.NotFoundHandler(),
@@ -453,11 +299,11 @@ func TestE2E_Run_NoneEmitterProducesZeroBytes(t *testing.T) {
 	go func() {
 		runDone <- Run(ctx, RunOptions{
 			Connect: Options{
-				ServerURL:  f.server.URL,
+				ServerURL:  f.URL(),
 				Unique:     "silent",
 				PrivateKey: freshKey(t),
-				TLSConfig:  f.tlsCfg,
-				Logger:     f.logger,
+				TLSConfig:  f.TLSConfig(),
+				Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
 				// Emitter intentionally nil; defaults to NoopEmitter.
 			},
 			Handler:    http.NotFoundHandler(),
@@ -471,12 +317,12 @@ func TestE2E_Run_NoneEmitterProducesZeroBytes(t *testing.T) {
 	// so poll the fake's counter.
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if f.registers.Load() >= 1 {
+		if f.Registrations() >= 1 {
 			break
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	if f.registers.Load() < 1 {
+	if f.Registrations() < 1 {
 		t.Fatal("fake tunneld never saw a Register frame")
 	}
 	cancel()
