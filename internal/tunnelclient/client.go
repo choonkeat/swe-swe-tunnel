@@ -47,6 +47,9 @@ type Options struct {
 	DialTimeout time.Duration
 	// Logger receives info/error events. Optional; defaults to slog.Default().
 	Logger *slog.Logger
+	// Emitter publishes structured lifecycle events for a parent supervisor.
+	// Optional; defaults to NoopEmitter (no stdout output).
+	Emitter Emitter
 }
 
 // Session is the established post-Register tunnel.
@@ -58,6 +61,7 @@ type Session struct {
 	priv         ed25519.PrivateKey // retained so Deregister can sign the request
 	ctrl         *yamux.Stream      // stream-1 control channel; reused for post-RegisterOK frames
 	conn         net.Conn           // TLS conn underlying the yamux session; closed on Close
+	emitter      Emitter            // captured from Options; never nil (NoopEmitter sentinel)
 }
 
 // Hostname returns the server-assigned hostname, e.g. "alpha-tunnel.example.com".
@@ -89,6 +93,10 @@ func Connect(ctx context.Context, opts Options) (*Session, error) {
 	logger := opts.Logger
 	if logger == nil {
 		logger = slog.Default()
+	}
+	em := opts.Emitter
+	if em == nil {
+		em = NoopEmitter{}
 	}
 
 	u, err := url.Parse(opts.ServerURL)
@@ -183,6 +191,7 @@ func Connect(ctx context.Context, opts Options) (*Session, error) {
 		return nil, fmt.Errorf("register: %w", err)
 	}
 	logger.Info("registered", "hostname", hostname)
+	em.Emit(EventRegisterOK, RegisterOKData{Hostname: hostname, Unique: opts.Unique})
 
 	return &Session{
 		yamux:        yam,
@@ -192,6 +201,7 @@ func Connect(ctx context.Context, opts Options) (*Session, error) {
 		priv:         opts.PrivateKey,
 		ctrl:         stream,
 		conn:         tlsConn,
+		emitter:      em,
 	}, nil
 }
 
@@ -243,6 +253,9 @@ func (s *Session) Deregister(ctx context.Context) error {
 	}
 	switch frame.Type {
 	case control.KindDeregisterOK:
+		if s.emitter != nil {
+			s.emitter.Emit(EventDeregisterOK, DeregisterOKData{Unique: s.unique})
+		}
 		return nil
 	case control.KindDeny:
 		var d control.Deny
