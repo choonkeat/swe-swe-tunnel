@@ -35,6 +35,17 @@ type certEnsurer interface {
 // brittle to clock drift.
 const maxClockSkew = 5 * time.Minute
 
+// preRegisterTimeout bounds the pre-Register phase of a connection:
+// from Hijack through yamux handshake, AcceptStream, and the first
+// frame read inside handleRegister. Any peer that doesn't make it that
+// far gets its conn torn down — closing the slow-loris DoS where a
+// hostile (or buggy) client holds a TCP slot indefinitely without ever
+// reaching the IP rate limit (which is checked *inside* handleRegister).
+//
+// var rather than const so tests can shorten it (a 10s default is too
+// slow to assert against in unit-test land).
+var preRegisterTimeout = 10 * time.Second
+
 // tunnelSession bundles a yamux session with its dedicated reverse proxy.
 // Building the proxy once per session lets us reuse a single Transport.
 type tunnelSession struct {
@@ -122,6 +133,21 @@ func connectHandler(
 			return
 		}
 
+		// Bound the entire pre-Register phase. After Hijack, the
+		// http.Server's ReadHeaderTimeout no longer governs this conn,
+		// so without an explicit deadline an attacker who completes
+		// Upgrade but never opens a stream (or never sends Register)
+		// holds a goroutine + FD + yamux state forever. yamux itself
+		// does not set deadlines on the underlying conn, so this
+		// timeout doesn't conflict with its keepalive/read loop —
+		// it strictly applies to "no progress at all".
+		preRegisterDeadline := time.Now().Add(preRegisterTimeout)
+		if err := conn.SetDeadline(preRegisterDeadline); err != nil {
+			logger.Warn("set pre-register deadline failed", "err", err)
+			_ = conn.Close()
+			return
+		}
+
 		if _, err := bufrw.WriteString("HTTP/1.1 101 Switching Protocols\r\n" +
 			"Connection: Upgrade\r\n" +
 			"Upgrade: " + control.UpgradeProtocol + "\r\n\r\n"); err != nil {
@@ -143,15 +169,25 @@ func connectHandler(
 		}
 		defer sess.Close()
 
-		stream, err := sess.AcceptStream()
+		acceptCtx, cancelAccept := context.WithDeadline(r.Context(), preRegisterDeadline)
+		stream, err := sess.AcceptStreamWithContext(acceptCtx)
+		cancelAccept()
 		if err != nil {
-			logger.Warn("accept control stream failed", "err", err)
+			logger.Warn("accept control stream failed", "err", err, "remote", conn.RemoteAddr().String())
 			return
 		}
 
 		ctx := r.Context()
 		regResult, ok := handleRegister(ctx, stream, store, certMgr, ipLimiter, pubkeyLimiter, logger, conn.RemoteAddr().String())
 		if !ok {
+			return
+		}
+
+		// Register completed: clear the conn deadline so the long-
+		// lived data plane (browser-driven yamux streams) isn't torn
+		// down at preRegisterTimeout.
+		if err := conn.SetDeadline(time.Time{}); err != nil {
+			logger.Warn("clear post-register deadline failed", "err", err)
 			return
 		}
 
