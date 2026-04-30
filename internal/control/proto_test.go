@@ -62,6 +62,82 @@ func TestFrameRoundTrip(t *testing.T) {
 	}
 }
 
+// Deny round-trips both fields, and RetryAfterSec=0 omits from JSON
+// (so old clients see exactly the same wire bytes as before this commit).
+func TestDenyRoundTrip_WithRetryAfter(t *testing.T) {
+	var buf bytes.Buffer
+	in := Deny{Reason: "rate_limited:ip", RetryAfterSec: 42}
+	if err := WriteMessage(&buf, KindDeny, in); err != nil {
+		t.Fatalf("WriteMessage: %v", err)
+	}
+	f, err := ReadFrame(&buf)
+	if err != nil {
+		t.Fatalf("ReadFrame: %v", err)
+	}
+	var out Deny
+	if err := DecodePayload(f, &out); err != nil {
+		t.Fatalf("DecodePayload: %v", err)
+	}
+	if out != in {
+		t.Errorf("round-trip: got %+v, want %+v", out, in)
+	}
+}
+
+// Backwards-compat assertion: a Deny payload from an OLD server (no
+// retry_after_seconds field) decodes cleanly and yields zero on the new
+// field — so the new client falls back to its own RateLimitFloor.
+func TestDeny_OldServerJSON_DecodesWithZero(t *testing.T) {
+	// Wire bytes a pre-commit-2 server would write.
+	var buf bytes.Buffer
+	if err := WriteFrame(&buf, Frame{
+		Type:    KindDeny,
+		Payload: []byte(`{"reason":"rate_limited:ip"}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	f, err := ReadFrame(&buf)
+	if err != nil {
+		t.Fatalf("ReadFrame: %v", err)
+	}
+	var out Deny
+	if err := DecodePayload(f, &out); err != nil {
+		t.Fatalf("DecodePayload: %v", err)
+	}
+	if out.Reason != "rate_limited:ip" {
+		t.Errorf("Reason = %q", out.Reason)
+	}
+	if out.RetryAfterSec != 0 {
+		t.Errorf("RetryAfterSec = %d, want 0 for old-server payload", out.RetryAfterSec)
+	}
+}
+
+// Forward-compat assertion: an OLD client unmarshalling a NEW server's
+// payload (with retry_after_seconds present) gets the Reason without
+// blowing up. The unknown field is silently ignored by encoding/json,
+// which is the contract this test pins.
+func TestDeny_NewServerJSON_OldClientIgnoresExtra(t *testing.T) {
+	// Old client only knows about Reason — model it as a struct without
+	// the new field.
+	type oldDeny struct {
+		Reason string `json:"reason"`
+	}
+	var buf bytes.Buffer
+	if err := WriteMessage(&buf, KindDeny, Deny{Reason: "rate_limited:ip", RetryAfterSec: 99}); err != nil {
+		t.Fatal(err)
+	}
+	f, err := ReadFrame(&buf)
+	if err != nil {
+		t.Fatalf("ReadFrame: %v", err)
+	}
+	var out oldDeny
+	if err := DecodePayload(f, &out); err != nil {
+		t.Fatalf("DecodePayload: %v", err)
+	}
+	if out.Reason != "rate_limited:ip" {
+		t.Errorf("Reason = %q, want rate_limited:ip", out.Reason)
+	}
+}
+
 func TestReadFrame_TooLarge(t *testing.T) {
 	hdr := make([]byte, 4)
 	binary.BigEndian.PutUint32(hdr, 1024*1024)

@@ -38,9 +38,15 @@ type Server struct {
 	registers atomic.Int32
 
 	mu        sync.Mutex
-	killAfter int      // 1-indexed nth registration to drop after RegisterOK
-	denyQueue []string // FIFO of Deny.Reason strings to send on the next Register frames
+	killAfter int          // 1-indexed nth registration to drop after RegisterOK
+	denyQueue []queuedDeny // FIFO of Deny payloads to send on the next Register frames
 	logf      func(format string, args ...any)
+}
+
+// queuedDeny is one entry on the Server's deny queue.
+type queuedDeny struct {
+	reason        string
+	retryAfterSec int
 }
 
 // Options configures the fake tunneld.
@@ -140,19 +146,27 @@ func (s *Server) KillNextSession() {
 func (s *Server) DenyNextRegister(reason string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.denyQueue = append(s.denyQueue, reason)
+	s.denyQueue = append(s.denyQueue, queuedDeny{reason: reason})
 }
 
-// nextDenyReason pops one queued deny reason; ok=false means none queued.
-func (s *Server) nextDenyReason() (string, bool) {
+// DenyNextRegisterWithRetryAfter is DenyNextRegister with a populated
+// Deny.RetryAfterSec — used to drive the client's RetryAfter handling.
+func (s *Server) DenyNextRegisterWithRetryAfter(reason string, retryAfterSec int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.denyQueue = append(s.denyQueue, queuedDeny{reason: reason, retryAfterSec: retryAfterSec})
+}
+
+// nextDeny pops one queued deny entry; ok=false means none queued.
+func (s *Server) nextDeny() (queuedDeny, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if len(s.denyQueue) == 0 {
-		return "", false
+		return queuedDeny{}, false
 	}
-	r := s.denyQueue[0]
+	d := s.denyQueue[0]
 	s.denyQueue = s.denyQueue[1:]
-	return r, true
+	return d, true
 }
 
 func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
@@ -216,9 +230,10 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		s.logf("tunneldfake: decode register: %v", err)
 		return
 	}
-	if reason, ok := s.nextDenyReason(); ok {
+	if d, ok := s.nextDeny(); ok {
 		if err := control.WriteMessage(stream, control.KindDeny, control.Deny{
-			Reason: reason,
+			Reason:        d.reason,
+			RetryAfterSec: d.retryAfterSec,
 		}); err != nil {
 			s.logf("tunneldfake: write deny: %v", err)
 		}

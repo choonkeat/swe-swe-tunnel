@@ -426,6 +426,149 @@ func TestE2E_Run_RateLimitDenyUsesLongFloor(t *testing.T) {
 	}
 }
 
+// TestE2E_Run_RateLimitDenyPrefersServerRetryAfter asserts that when a
+// deny carries Deny.RetryAfterSec, the client uses it as the next
+// backoff — even when it's *shorter* than RunOptions.RateLimitFloor.
+// The server's hint is authoritative because it knows exactly when the
+// limiter window frees up.
+func TestE2E_Run_RateLimitDenyPrefersServerRetryAfter(t *testing.T) {
+	f := newFakeTunneld(t)
+	// Server says "retry in 1 second" but our local floor is 30 seconds.
+	// The client must obey the server.
+	f.DenyNextRegisterWithRetryAfter("rate_limited:ip", 1)
+
+	cap := &captureBuffer{}
+	em := NewJSONLEmitter(cap)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- Run(ctx, RunOptions{
+			Connect: Options{
+				ServerURL:  f.URL(),
+				Unique:     "serverhint",
+				PrivateKey: freshKey(t),
+				TLSConfig:  f.TLSConfig(),
+				Logger:     logger,
+				Emitter:    em,
+			},
+			Handler:        http.NotFoundHandler(),
+			BackoffMin:     5 * time.Millisecond,
+			BackoffMax:     20 * time.Millisecond,
+			RateLimitFloor: 30 * time.Second, // intentionally large
+		})
+	}()
+
+	// If the run loop wrongly used the floor (30s), the second
+	// register_ok would not arrive within 5s and this would fail.
+	waitForKind(t, cap, EventRegisterOK, 5*time.Second)
+	cancel()
+	select {
+	case <-runDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run didn't return after cancel")
+	}
+
+	// Inspect the reconnecting event after the deny: after_ms must
+	// equal ~1000 (the server's hint), not 30000 (the floor).
+	sc := bufio.NewScanner(bytes.NewReader(cap.Bytes()))
+	var sawServerHint bool
+	for sc.Scan() {
+		line := bytes.TrimSpace(sc.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		var ev struct {
+			Kind string                 `json:"kind"`
+			Data map[string]interface{} `json:"data"`
+		}
+		_ = json.Unmarshal(line, &ev)
+		if ev.Kind != EventReconnecting {
+			continue
+		}
+		afterMs, _ := ev.Data["after_ms"].(float64)
+		// 1s == 1000ms; allow some slack for serialization.
+		if afterMs >= 1000 && afterMs < 5_000 {
+			sawServerHint = true
+			break
+		}
+	}
+	if !sawServerHint {
+		t.Errorf("expected reconnecting.after_ms ≈ 1000 (server hint), but none seen. Stream:\n%s",
+			cap.Bytes())
+	}
+}
+
+// TestE2E_Run_RateLimitDenyZeroRetryAfterFallsBackToFloor confirms the
+// fallback path: when the server's Deny lacks a RetryAfter (omitempty
+// wire payload, or pre-Commit-2 server), the client uses
+// RunOptions.RateLimitFloor.
+func TestE2E_Run_RateLimitDenyZeroRetryAfterFallsBackToFloor(t *testing.T) {
+	f := newFakeTunneld(t)
+	// DenyNextRegister sends a Deny with RetryAfterSec=0 (no hint).
+	f.DenyNextRegister("rate_limited:ip")
+
+	cap := &captureBuffer{}
+	em := NewJSONLEmitter(cap)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	const floor = 200 * time.Millisecond
+
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- Run(ctx, RunOptions{
+			Connect: Options{
+				ServerURL:  f.URL(),
+				Unique:     "fallback",
+				PrivateKey: freshKey(t),
+				TLSConfig:  f.TLSConfig(),
+				Logger:     logger,
+				Emitter:    em,
+			},
+			Handler:        http.NotFoundHandler(),
+			BackoffMin:     5 * time.Millisecond,
+			BackoffMax:     10 * time.Millisecond,
+			RateLimitFloor: floor,
+		})
+	}()
+
+	waitForKind(t, cap, EventRegisterOK, 5*time.Second)
+	cancel()
+	<-runDone
+
+	sc := bufio.NewScanner(bytes.NewReader(cap.Bytes()))
+	var sawFloor bool
+	for sc.Scan() {
+		line := bytes.TrimSpace(sc.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		var ev struct {
+			Kind string                 `json:"kind"`
+			Data map[string]interface{} `json:"data"`
+		}
+		_ = json.Unmarshal(line, &ev)
+		if ev.Kind != EventReconnecting {
+			continue
+		}
+		afterMs, _ := ev.Data["after_ms"].(float64)
+		if afterMs >= float64(floor/time.Millisecond) {
+			sawFloor = true
+			break
+		}
+	}
+	if !sawFloor {
+		t.Errorf("expected reconnecting.after_ms >= %dms (floor) when no server hint, but none seen. Stream:\n%s",
+			floor/time.Millisecond, cap.Bytes())
+	}
+}
+
 // TestE2E_Run_NonRateLimitDenyUsesExponential confirms the floor only
 // kicks in for rate_limited:* — a transient non-rate-limit deny (e.g.
 // "store error") must still use the normal exponential schedule, not

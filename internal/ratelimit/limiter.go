@@ -102,3 +102,48 @@ func (s *SlidingWindow) Size() int {
 	defer s.mu.Unlock()
 	return len(s.seen)
 }
+
+// RetryAfter returns how long until the next call to Allow(key) can
+// possibly succeed: i.e. the time until the oldest sample currently in
+// the window ages out. Returns zero when the window has spare capacity
+// (Allow would already succeed) or when limits are disabled.
+//
+// Used by the server to populate Deny.RetryAfterSec, so a rate-limited
+// client can back off exactly long enough instead of guessing.
+func (s *SlidingWindow) RetryAfter(key string) time.Duration {
+	return s.RetryAfterAt(key, s.now())
+}
+
+// RetryAfterAt is the deterministic variant used by tests.
+func (s *SlidingWindow) RetryAfterAt(key string, now time.Time) time.Duration {
+	if s.max <= 0 {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	cutoff := now.Add(-s.window)
+	samples := s.seen[key]
+
+	// Drop entries older than the window so the count below is accurate.
+	i := 0
+	for i < len(samples) && !samples[i].After(cutoff) {
+		i++
+	}
+	if i > 0 {
+		samples = samples[i:]
+		s.seen[key] = samples
+	}
+
+	if len(samples) < s.max {
+		// Spare capacity → no wait required.
+		return 0
+	}
+	// Window is full; the oldest sample expires `window` after it was
+	// recorded. d may be <= 0 in pathological clock-skew cases; clamp.
+	d := samples[0].Add(s.window).Sub(now)
+	if d < 0 {
+		return 0
+	}
+	return d
+}

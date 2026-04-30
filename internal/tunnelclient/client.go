@@ -40,6 +40,12 @@ type DenyError struct {
 	Reason string
 	// Op is "register" or "deregister", whichever flow surfaced this.
 	Op string
+	// RetryAfter is the server's hint for how long to wait before
+	// retrying. Set only on rate_limited:* denies; zero otherwise.
+	// Run uses this in preference to RunOptions.RateLimitFloor when
+	// non-zero. Old servers don't populate the field and clients fall
+	// back to the floor.
+	RetryAfter time.Duration
 }
 
 // Error formats the deny for human-readable error chains.
@@ -303,7 +309,11 @@ func (s *Session) Deregister(ctx context.Context) error {
 	case control.KindDeny:
 		var d control.Deny
 		_ = control.DecodePayload(frame, &d)
-		return &DenyError{Reason: d.Reason, Op: "deregister"}
+		return &DenyError{
+			Reason:     d.Reason,
+			Op:         "deregister",
+			RetryAfter: time.Duration(d.RetryAfterSec) * time.Second,
+		}
 	default:
 		return fmt.Errorf("unexpected frame %q in Deregister response", frame.Type)
 	}
@@ -432,7 +442,11 @@ func registerWithServer(stream io.ReadWriter, unique string, priv ed25519.Privat
 	case control.KindDeny:
 		var d control.Deny
 		_ = control.DecodePayload(frame, &d)
-		return "", &DenyError{Reason: d.Reason, Op: "register"}
+		return "", &DenyError{
+			Reason:     d.Reason,
+			Op:         "register",
+			RetryAfter: time.Duration(d.RetryAfterSec) * time.Second,
+		}
 	default:
 		return "", fmt.Errorf("unexpected frame type %q", frame.Type)
 	}

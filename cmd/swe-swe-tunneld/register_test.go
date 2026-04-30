@@ -387,7 +387,7 @@ func TestHandleRegister_PerIPRateLimit(t *testing.T) {
 
 	_, priv := newKey(t)
 	h.sendRegister("alpha", priv, time.Now().Unix())
-	expectDeny(t, h, "rate_limited:ip")
+	expectDenyWithRetryAfter(t, h, "rate_limited:ip", 1)
 }
 
 func TestHandleRegister_PerPubkeyRateLimit(t *testing.T) {
@@ -399,7 +399,8 @@ func TestHandleRegister_PerPubkeyRateLimit(t *testing.T) {
 	h.start()
 
 	h.sendRegister("alpha", priv, time.Now().Unix())
-	expectDeny(t, h, "rate_limited:pubkey")
+	// 24h window; one slot consumed → retry-after must be ~24h.
+	expectDenyWithRetryAfter(t, h, "rate_limited:pubkey", 1)
 }
 
 // Idempotent reconnect (existing unique, same pubkey) must NOT consume a
@@ -531,6 +532,30 @@ func expectDenyContains(t *testing.T, h *regHarness, substr string) {
 	_ = control.DecodePayload(f, &d)
 	if !bytes.Contains([]byte(d.Reason), []byte(substr)) {
 		t.Errorf("Deny.Reason = %q, want substring %q", d.Reason, substr)
+	}
+	res := h.awaitResult()
+	if res.ok {
+		t.Error("handleRegister returned ok=true on deny path")
+	}
+}
+
+// expectDenyWithRetryAfter verifies a rate-limit deny carries a positive
+// RetryAfterSec >= minSec. We can't pin the exact value because the
+// handler computes it from time.Now() against a real SlidingWindow, so
+// the test only asserts the lower bound: a server that forgets to set
+// the field returns zero, which fails this check.
+func expectDenyWithRetryAfter(t *testing.T, h *regHarness, wantReason string, minSec int) {
+	t.Helper()
+	f := h.expectKind(control.KindDeny)
+	var d control.Deny
+	if err := control.DecodePayload(f, &d); err != nil {
+		t.Fatalf("decode Deny: %v", err)
+	}
+	if d.Reason != wantReason {
+		t.Errorf("Deny.Reason = %q, want %q", d.Reason, wantReason)
+	}
+	if d.RetryAfterSec < minSec {
+		t.Errorf("Deny.RetryAfterSec = %d, want >= %d", d.RetryAfterSec, minSec)
 	}
 	res := h.awaitResult()
 	if res.ok {

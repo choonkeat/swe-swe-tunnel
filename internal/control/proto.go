@@ -87,8 +87,17 @@ type Proof struct {
 }
 
 // Deny is a terminal failure reply.
+//
+// RetryAfterSec is the server's hint for how long the client should
+// wait before retrying. It is set only on rate_limited:* denies (zero
+// otherwise) and is populated from the relevant SlidingWindow's
+// RetryAfter, so the client can back off exactly long enough instead
+// of guessing. Backwards-compatible: old clients ignore the field;
+// new clients seeing zero from older servers fall back to their own
+// RateLimitFloor.
 type Deny struct {
-	Reason string `json:"reason"`
+	Reason        string `json:"reason"`
+	RetryAfterSec int    `json:"retry_after_seconds,omitempty"`
 }
 
 // Deregister releases ownership of a unique. Sig must verify against the

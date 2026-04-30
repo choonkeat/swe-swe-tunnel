@@ -245,8 +245,10 @@ func handleRegister(
 		ipKey = h
 	}
 	if ipLimiter != nil && !ipLimiter.Allow(ipKey) {
-		logger.Warn("register denied: ip rate limit", "remote", remoteAddr, "unique", reg.Unique)
-		sendDeny(stream, "rate_limited:ip")
+		retry := int(ipLimiter.RetryAfter(ipKey).Seconds()) + 1
+		logger.Warn("register denied: ip rate limit",
+			"remote", remoteAddr, "unique", reg.Unique, "retry_after_sec", retry)
+		sendRateLimitDeny(stream, "rate_limited:ip", retry)
 		return registerResult{}, false
 	}
 
@@ -285,8 +287,10 @@ func handleRegister(
 		// resource. The IP rate limit (above) still throttles
 		// connect-spam regardless.
 		if pubkeyLimiter != nil && !pubkeyLimiter.Allow(string(pub)) {
-			logger.Warn("register denied: pubkey rate limit", "remote", remoteAddr, "unique", reg.Unique)
-			sendDeny(stream, "rate_limited:pubkey")
+			retry := int(pubkeyLimiter.RetryAfter(string(pub)).Seconds()) + 1
+			logger.Warn("register denied: pubkey rate limit",
+				"remote", remoteAddr, "unique", reg.Unique, "retry_after_sec", retry)
+			sendRateLimitDeny(stream, "rate_limited:pubkey", retry)
 			return registerResult{}, false
 		}
 		// Issue cert FIRST (may fail; if so, the store stays clean).
@@ -365,6 +369,17 @@ func handleRegister(
 
 func sendDeny(w io.Writer, reason string) {
 	_ = control.WriteMessage(w, control.KindDeny, control.Deny{Reason: reason})
+}
+
+// sendRateLimitDeny is sendDeny + a server-supplied retry-after hint
+// (seconds until the offending limiter has spare capacity again). The
+// client uses this to back off precisely instead of relying on its
+// hardcoded RateLimitFloor.
+func sendRateLimitDeny(w io.Writer, reason string, retryAfterSec int) {
+	_ = control.WriteMessage(w, control.KindDeny, control.Deny{
+		Reason:        reason,
+		RetryAfterSec: retryAfterSec,
+	})
 }
 
 // runControlLoop dispatches inbound control frames after RegisterOK.

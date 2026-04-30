@@ -125,14 +125,24 @@ func Run(ctx context.Context, ro RunOptions) error {
 				})
 				return err
 			}
-			// rate_limited:* denies override the exponential schedule
-			// with a longer floor — see RunOptions.RateLimitFloor for
-			// rationale. Hammering on a 30s ceiling against the server's
-			// hour- and day-scale windows just burns budget without
-			// progress.
+			// rate_limited:* denies override the exponential schedule.
+			// Prefer the server-supplied RetryAfter when present — the
+			// server knows exactly when the offending window frees up,
+			// so its hint is authoritative. Fall back to
+			// RunOptions.RateLimitFloor for older servers that don't
+			// populate the field.
+			//
+			// The default schedule (capped at BackoffMax = 30s) is
+			// useless against tunneld's hour- and day-scale windows;
+			// pinging at 30s just keeps the budget exhausted.
 			delay := backoffDuration(attempt, backoffMin, backoffMax)
-			if errors.As(err, &denyErr) && denyErr.IsRateLimit() && delay < rateLimitFloor {
-				delay = rateLimitFloor
+			if errors.As(err, &denyErr) && denyErr.IsRateLimit() {
+				switch {
+				case denyErr.RetryAfter > 0:
+					delay = denyErr.RetryAfter
+				case delay < rateLimitFloor:
+					delay = rateLimitFloor
+				}
 			}
 			attempt++
 			em.Emit(EventReconnecting, ReconnectingData{

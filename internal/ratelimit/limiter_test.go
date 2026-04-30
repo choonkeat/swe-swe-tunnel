@@ -85,6 +85,88 @@ func TestSlidingWindow_Prune(t *testing.T) {
 	}
 }
 
+func TestSlidingWindow_RetryAfter_ZeroWhenSpareCapacity(t *testing.T) {
+	lim := New(3, time.Hour)
+	t0 := time.Unix(1714137600, 0)
+
+	// Empty: trivially zero.
+	if d := lim.RetryAfterAt("k", t0); d != 0 {
+		t.Errorf("RetryAfter on empty key = %v, want 0", d)
+	}
+	// One sample, capacity 3: still has spare.
+	_ = lim.AllowAt("k", t0)
+	if d := lim.RetryAfterAt("k", t0); d != 0 {
+		t.Errorf("RetryAfter with 1/3 used = %v, want 0", d)
+	}
+	// Two samples: still has spare.
+	_ = lim.AllowAt("k", t0.Add(5*time.Minute))
+	if d := lim.RetryAfterAt("k", t0.Add(5*time.Minute)); d != 0 {
+		t.Errorf("RetryAfter with 2/3 used = %v, want 0", d)
+	}
+}
+
+func TestSlidingWindow_RetryAfter_FullWindow(t *testing.T) {
+	lim := New(2, time.Hour)
+	t0 := time.Unix(1714137600, 0)
+
+	_ = lim.AllowAt("k", t0)
+	_ = lim.AllowAt("k", t0.Add(15*time.Minute))
+
+	// Window is full; oldest sample at t0 expires at t0+1h.
+	// At t0+30min, retry-after should be 30min (until oldest expires).
+	if got, want := lim.RetryAfterAt("k", t0.Add(30*time.Minute)), 30*time.Minute; got != want {
+		t.Errorf("RetryAfter at t0+30min = %v, want %v", got, want)
+	}
+	// At t0+59min, retry-after is 1min.
+	if got, want := lim.RetryAfterAt("k", t0.Add(59*time.Minute)), 1*time.Minute; got != want {
+		t.Errorf("RetryAfter at t0+59min = %v, want %v", got, want)
+	}
+	// Past expiry of the oldest sample: capacity returns, retry-after = 0.
+	if got := lim.RetryAfterAt("k", t0.Add(time.Hour+time.Second)); got != 0 {
+		t.Errorf("RetryAfter past first sample expiry = %v, want 0", got)
+	}
+}
+
+func TestSlidingWindow_RetryAfter_DisabledReturnsZero(t *testing.T) {
+	lim := New(0, time.Hour)
+	t0 := time.Unix(1714137600, 0)
+	if d := lim.RetryAfterAt("k", t0); d != 0 {
+		t.Errorf("RetryAfter on max=0 limiter = %v, want 0", d)
+	}
+}
+
+func TestSlidingWindow_RetryAfter_DistinctKeys(t *testing.T) {
+	lim := New(1, time.Hour)
+	t0 := time.Unix(1714137600, 0)
+
+	_ = lim.AllowAt("a", t0)
+	// "a" is full, "b" is empty.
+	if got, want := lim.RetryAfterAt("a", t0.Add(10*time.Minute)), 50*time.Minute; got != want {
+		t.Errorf("RetryAfter('a') = %v, want %v", got, want)
+	}
+	if got := lim.RetryAfterAt("b", t0.Add(10*time.Minute)); got != 0 {
+		t.Errorf("RetryAfter('b', no samples) = %v, want 0", got)
+	}
+}
+
+// Allow + RetryAfter agree: when Allow returns false, RetryAfter must be
+// strictly positive; when Allow returns true, RetryAfter may be zero
+// (immediately) or positive (after consuming the Nth slot).
+func TestSlidingWindow_RetryAfter_AgreesWithAllow(t *testing.T) {
+	lim := New(2, time.Hour)
+	t0 := time.Unix(1714137600, 0)
+
+	_ = lim.AllowAt("k", t0)
+	_ = lim.AllowAt("k", t0.Add(10*time.Minute))
+	// Window full now: Allow must deny, RetryAfter must be positive.
+	if lim.AllowAt("k", t0.Add(20*time.Minute)) {
+		t.Fatal("Allow: want false on full window")
+	}
+	if d := lim.RetryAfterAt("k", t0.Add(20*time.Minute)); d <= 0 {
+		t.Errorf("RetryAfter on denied call = %v, want > 0", d)
+	}
+}
+
 func TestSlidingWindow_Concurrent(t *testing.T) {
 	lim := New(100, time.Hour)
 	var wg sync.WaitGroup
