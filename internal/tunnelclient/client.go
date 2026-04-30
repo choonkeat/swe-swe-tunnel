@@ -350,7 +350,12 @@ func Serve(ctx context.Context, sess *Session, handler http.Handler) error {
 // port from the leftmost label of the request's Host header and reverse-
 // proxies to `{target}:{port}`. X-Forwarded-* headers from the upstream
 // (the public-facing tunneld) pass through unchanged.
-func PortDispatchHandler(target string, logger *slog.Logger) http.Handler {
+//
+// policy gates which ports are forwarded — anything outside the
+// allowlist returns 404 before the upstream dial, preventing the
+// public Internet from reaching every localhost port. Pass
+// AllowAllPorts() to disable the gate (tests, opt-in operators).
+func PortDispatchHandler(target string, policy *PortPolicy, logger *slog.Logger) http.Handler {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -371,7 +376,7 @@ func PortDispatchHandler(target string, logger *slog.Logger) http.Handler {
 				return
 			}
 			logger.Warn("upstream error", "err", err, "host", r.Host, "path", r.URL.Path)
-			http.Error(w, "upstream error: "+err.Error(), http.StatusBadGateway)
+			http.Error(w, "upstream error", http.StatusBadGateway)
 		},
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -380,8 +385,15 @@ func PortDispatchHandler(target string, logger *slog.Logger) http.Handler {
 			http.Error(w, "missing port label in Host", http.StatusBadRequest)
 			return
 		}
-		if _, err := strconv.Atoi(port); err != nil {
+		n, err := strconv.Atoi(port)
+		if err != nil {
 			http.Error(w, "non-numeric port label", http.StatusBadRequest)
+			return
+		}
+		if !policy.Permits(n) {
+			logger.Warn("port not in allowlist; rejecting",
+				"port", n, "host", r.Host, "remote", r.RemoteAddr)
+			http.Error(w, "port not allowed", http.StatusNotFound)
 			return
 		}
 		rp.ServeHTTP(w, r)

@@ -27,6 +27,7 @@ func main() {
 		stateFile    = flag.String("state-file", "/workspace/.swe-swe/tunnel-state.json", "path to write JSON {hostname,unique,registered_at} after RegisterOK; empty to disable")
 		insecure     = flag.Bool("insecure", false, "skip TLS verification (testing only)")
 		reportFormat = flag.String("report-format", "none", "supervisor event format on stdout: none|jsonl (env: SWE_TUNNEL_REPORT_FORMAT)")
+		ports        = flag.String("ports", tunnelclient.DefaultPortSpec, "allowlist of forwardable ports (comma-separated, ranges like 3000-3099); 'all' disables the gate (DANGEROUS — exposes every localhost port to the Internet)")
 	)
 	flag.Parse()
 
@@ -53,11 +54,21 @@ func main() {
 	if envRF, ok := os.LookupEnv("SWE_TUNNEL_REPORT_FORMAT"); ok && !flagSet("report-format") {
 		*reportFormat = envRF
 	}
+	if envP, ok := os.LookupEnv("SWE_TUNNEL_PORTS"); ok && !flagSet("ports") {
+		*ports = envP
+	}
 	if *server == "" || *unique == "" {
 		flag.Usage()
 		logger.Error("--server and --unique are required (or SWE_TUNNEL_SERVER / SWE_TUNNEL_UNIQUE)")
 		os.Exit(2)
 	}
+
+	policy, err := tunnelclient.ParsePortPolicy(*ports)
+	if err != nil {
+		logger.Error("invalid --ports", "value", *ports, "err", err)
+		os.Exit(2)
+	}
+	logger.Info("port policy", "spec", policy.String())
 
 	emitter, err := buildEmitter(*reportFormat, os.Stdout, logger)
 	if err != nil {
@@ -107,7 +118,7 @@ func main() {
 			Logger:     logger,
 			Emitter:    emitter,
 		},
-		Handler:      tunnelclient.PortDispatchHandler(*target, logger),
+		Handler:      tunnelclient.PortDispatchHandler(*target, policy, logger),
 		PostRegister: postRegister,
 	})
 	if runErr != nil {

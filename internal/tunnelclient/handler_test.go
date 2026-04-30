@@ -27,7 +27,7 @@ func TestPortDispatchHandler_RoutesByLeftmostLabel(t *testing.T) {
 	port2 := u2.Port()
 
 	// PortDispatchHandler builds {target}:{port}. Use 127.0.0.1 as target.
-	h := PortDispatchHandler("127.0.0.1", discardLogger())
+	h := PortDispatchHandler("127.0.0.1", AllowAllPorts(), discardLogger())
 
 	for name, tc := range map[string]struct {
 		host       string
@@ -80,7 +80,7 @@ func TestPortDispatchHandler_PreservesXForwarded(t *testing.T) {
 	defer upstream.Close()
 
 	port := mustParseURL(t, upstream.URL).Port()
-	h := PortDispatchHandler("127.0.0.1", discardLogger())
+	h := PortDispatchHandler("127.0.0.1", AllowAllPorts(), discardLogger())
 
 	req := httptest.NewRequest("GET", "http://"+port+".alpha-tunnel.example.com/", nil)
 	req.Host = port + ".alpha-tunnel.example.com"
