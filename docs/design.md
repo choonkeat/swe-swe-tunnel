@@ -298,16 +298,7 @@ DNS provider credentials follow `lego`'s env conventions (`DNSIMPLE_OAUTH_TOKEN`
 | `--target` | `SWE_TUNNEL_TARGET` | `127.0.0.1` | default forward target |
 | `--port-target` | repeated | none | per-port override `--port-target=3000=192.168.1.5:8080` (planned) |
 | `--insecure` | — | false | skip TLS verification (testing only) |
-| `--state-file` | `SWE_TUNNEL_STATE_FILE` | `/workspace/.swe-swe/tunnel-state.json` | written after REGISTER_OK (Phase 3) |
-
-State file (consumed by swe-swe):
-```json
-{
-  "hostname": "abc-tunnel.example.com",
-  "unique": "abc",
-  "registered_at": "2026-04-26T10:00:00Z"
-}
-```
+| `--report-format` | `SWE_TUNNEL_REPORT_FORMAT` | `none` | structured event stream on stdout: `none` or `jsonl`. See `tasks/2026-04-29-supervisor-event-protocol.md`. |
 
 ## Phased delivery
 

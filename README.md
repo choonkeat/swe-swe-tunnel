@@ -6,10 +6,9 @@ See [`docs/design.md`](docs/design.md) for the architecture and protocol.
 
 ## Status
 
-* **Server** (`cmd/swe-swe-tunneld`): production-ready. Single `:443`, registration with Ed25519 identity + per-IP / per-pubkey rate limits, on-demand per-session ACME wildcard certs, `Deregister` for graceful release, `tunnel-state.json` producer for downstream consumers.
-* **Client** (`cmd/swe-swe-tunnel`): production-ready. One outbound TLS connection to the server; serves all configured ports of the local host through that one connection.
-* **swe-swe consumer** (lives in [the swe-swe repo](https://github.com/choonkeat/swe-swe)): v1 shipped (`--public-hostname` flag + `SWE_PUBLIC_HOSTNAME` env). v1.1 (state-file fallback) tracked in `tasks/2026-04-28-swe-swe-tunnel-state-file-fallback.md` over there.
-* **Deferred**: multi-port allowlist (Phase 4), ops polish — `/metrics`, graceful drain, runbook (Phase 6).
+* **Server** (`cmd/swe-swe-tunneld`): production-ready. Single `:443`, registration with Ed25519 identity + per-IP / per-pubkey rate limits, on-demand per-session ACME wildcard certs, `Deregister` for graceful release.
+* **Client** (`cmd/swe-swe-tunnel`): production-ready. One outbound TLS connection to the server; serves the configured ports of the local host through that one connection. Emits a structured JSONL event stream on stdout for parent supervisors (`--report-format=jsonl`).
+* **Deferred**: ops polish — `/metrics`, graceful drain, runbook (Phase 6).
 
 ## Quickstart
 
@@ -60,7 +59,8 @@ DNS-provider credentials are read from the lego provider's standard env vars (e.
 | `--unique` | `SWE_TUNNEL_UNIQUE` | — | yes | Bare label; server appends `-tunnel` (see "Naming"). |
 | `--target` | — | `127.0.0.1` | no | Forward target host. Port comes from the leftmost Host label. |
 | `--identity-key` | `SWE_TUNNEL_KEY` | `~/.swe-swe-tunnel/identity.key` | no | Ed25519 private key. Auto-generated on first run. |
-| `--state-file` | `SWE_TUNNEL_STATE_FILE` | `/workspace/.swe-swe/tunnel-state.json` | no | JSON file written after RegisterOK; consumers (e.g. swe-swe) read it. Empty disables. |
+| `--ports` | `SWE_TUNNEL_PORTS` | (built-in safe set) | no | Comma-separated allowlist of forwardable ports (ranges OK: `3000-3099`); `all` disables the gate. |
+| `--report-format` | `SWE_TUNNEL_REPORT_FORMAT` | `none` | no | Structured event stream on stdout: `none` or `jsonl`. See `tasks/2026-04-29-supervisor-event-protocol.md`. |
 | `--insecure` | — | `false` | no | Skip TLS verification. Testing only. |
 
 ### Naming: `unique` vs `{unique}-tunnel`
@@ -139,7 +139,7 @@ The choice of ACME DNS-01 provider is **independent** of the apex DNS host's wil
 
 Compatible with the standalone `lego` CLI layout — you can inspect or operate on cert state with `lego` directly if needed.
 
-The client also persists `~/.swe-swe-tunnel/identity.key` (Ed25519 PKCS8 PEM, mode 0600) and writes the post-Connect state file (default `/workspace/.swe-swe/tunnel-state.json`).
+The client persists `~/.swe-swe-tunnel/identity.key` (Ed25519 PKCS8 PEM, mode 0600).
 
 ## Deregister (graceful release)
 

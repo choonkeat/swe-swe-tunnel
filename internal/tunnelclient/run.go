@@ -23,12 +23,6 @@ type RunOptions struct {
 	// Handler serves incoming yamux streams as HTTP requests. Required.
 	Handler http.Handler
 
-	// PostRegister is called once after every successful Register, before
-	// Serve. Typical use: write the state file. A non-nil error is
-	// surfaced as an EventError(retryable=false) but does not abort the
-	// session — the tunnel still works without the state file.
-	PostRegister func(*Session) error
-
 	// BackoffMin is the first reconnect delay. Zero defaults to 1s.
 	BackoffMin time.Duration
 
@@ -157,13 +151,6 @@ func Run(ctx context.Context, ro RunOptions) error {
 
 		// Connect already emitted register_ok.
 		attempt = 1
-
-		if ro.PostRegister != nil {
-			if err := ro.PostRegister(sess); err != nil {
-				logger.Warn("post-register hook failed", "err", err)
-				em.Emit(EventError, ErrorData{Message: err.Error(), Retryable: false})
-			}
-		}
 
 		// Serve runs in a child context so we can stop it AFTER a
 		// graceful Deregister round-trip. Serve's httpSrv.Shutdown

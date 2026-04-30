@@ -2,19 +2,25 @@
 
 ## Status
 
-**Proposed (2026-04-29).** No code changes yet; this file captures
-the contract a parent supervisor (e.g. swe-swe-server) needs from
-the swe-swe-tunnel client when it runs as a child process.
+**Shipped (2026-05-01).** Producer (this repo) implemented in commits
+`d4ef869` (emitter), `34c60b8` (lifecycle wiring), `8272af0` (CLI flag),
+`413171c` / `e68c7b0` (e2e coverage). Consumer (swe-swe) migrated in
+commit `773ce8b6` ("rip out --public-hostname / --tunnel-state-file").
+The state-file writer was removed from this repo on 2026-05-01 once the
+consumer no longer reads it.
+
+This file is preserved as the contract documentation: it describes the
+event stream that supervisors consume from the tunnel client.
 
 Companion plan in the consumer repo:
 `/workspace/tasks/2026-04-29-tunnel-subprocess-pivot.md`.
 
 ## Why
 
-Today the tunnel client logs human-readable text to stderr and
-optionally writes a JSON state file (`tunnel-state.json`) at a
-configured path. Both are observation outputs. Neither is suitable
-for a parent process that needs to:
+Earlier the tunnel client logged human-readable text to stderr and
+wrote a JSON state file (`tunnel-state.json`) at a configured path. Both
+were observation outputs. Neither was suitable for a parent process
+that needs to:
 
 1. Learn the assigned hostname **the moment it is assigned**, not
    "some time after a file lands on disk."
@@ -40,12 +46,10 @@ In-scope:
   and connection lifecycle.
 - Tests for emitter shape and ordering.
 
-Out of scope:
+Out of scope (during the original design):
 
-- Removing the state-file writer. It stays as-is. A future task can
-  delete it once no one reads it; today the gate is just "supervisors
-  prefer events, file is a fallback we no longer document for new
-  consumers."
+- Removing the state-file writer. (This was completed 2026-05-01 once
+  the swe-swe consumer migrated.)
 - Bidirectional control. The supervisor sends signals (SIGTERM for
   graceful shutdown), not structured input. If we ever need control
   beyond signals, it goes on stdin in a follow-up.
@@ -67,7 +71,7 @@ Or the env equivalent `SWE_TUNNEL_REPORT_FORMAT`.
   stray `fmt.Println` on stdout to keep the channel clean for
   future use).
 - `jsonl`: one JSON event per line on stdout, terminated by `\n`.
-  Stderr unchanged. The state-file writer is unaffected.
+  Stderr unchanged.
 
 The flag is opt-in so non-supervised invocations (interactive ops,
 existing CI scripts) see no change. swe-swe-server passes
@@ -204,15 +208,16 @@ second in normal operation.
 - `--report-format=none` (default) produces zero stdout output
   during a normal lifecycle. Test the empty-stdout invariant.
 
-## Sequencing
+## Sequencing (historical)
 
-The producer (this repo) must ship before the consumer (swe-swe)
-can rip out its state-file fallback. Order:
+The producer (this repo) had to ship before the consumer (swe-swe)
+could rip out its state-file fallback. Completed order:
 
-1. Land this task on `swe-swe-tunnel`'s `main`.
-2. Tag a release.
-3. swe-swe-server's pivot task lands, importing the new tunnel-client
-   binary version.
+1. ✅ Producer landed on `swe-swe-tunnel`'s `main`
+   (commits `d4ef869` / `34c60b8` / `8272af0` / `413171c` / `e68c7b0`).
+2. ✅ swe-swe-server's pivot task landed, importing the new
+   tunnel-client binary version (`773ce8b6` rip-out).
+3. ✅ State-file writer removed from this repo (2026-05-01).
 
 ## Open questions
 

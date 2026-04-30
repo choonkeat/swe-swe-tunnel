@@ -161,7 +161,6 @@ func TestBinary_DefaultFormat_StdoutEmpty(t *testing.T) {
 			"--server", f.URL(),
 			"--unique", "alpha",
 			"--insecure",
-			"--state-file", "",
 			"--identity-key", filepath.Join(keyDir, "id.key"),
 		},
 		nil,
@@ -210,7 +209,6 @@ func TestBinary_JSONLFormat_StdoutHasLifecycle(t *testing.T) {
 			"--server", f.URL(),
 			"--unique", "alpha",
 			"--insecure",
-			"--state-file", "",
 			"--identity-key", filepath.Join(keyDir, "id.key"),
 			"--report-format", "jsonl",
 		},
@@ -283,7 +281,6 @@ func TestBinary_JSONLFormat_EnvVar(t *testing.T) {
 			"--server", f.URL(),
 			"--unique", "alpha",
 			"--insecure",
-			"--state-file", "",
 			"--identity-key", filepath.Join(keyDir, "id.key"),
 		},
 		[]string{"SWE_TUNNEL_REPORT_FORMAT=jsonl"},
@@ -307,7 +304,6 @@ func TestBinary_BadReportFormat_ExitsNonZero(t *testing.T) {
 		"--server", "https://127.0.0.1:1",
 		"--unique", "alpha",
 		"--insecure",
-		"--state-file", "",
 		"--report-format", "yaml",
 	)
 	out, err := cmd.CombinedOutput()

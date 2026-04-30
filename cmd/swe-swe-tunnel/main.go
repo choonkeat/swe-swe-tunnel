@@ -24,7 +24,6 @@ func main() {
 		unique       = flag.String("unique", "", "requested name (required); server stores it as {unique}-tunnel")
 		target       = flag.String("target", "127.0.0.1", "default forward target host (port comes from Host header label)")
 		identityKey  = flag.String("identity-key", "", "path to Ed25519 identity key (default ~/.swe-swe-tunnel/identity.key)")
-		stateFile    = flag.String("state-file", "/workspace/.swe-swe/tunnel-state.json", "path to write JSON {hostname,unique,registered_at} after RegisterOK; empty to disable")
 		insecure     = flag.Bool("insecure", false, "skip TLS verification (testing only)")
 		reportFormat = flag.String("report-format", "none", "supervisor event format on stdout: none|jsonl (env: SWE_TUNNEL_REPORT_FORMAT)")
 		ports        = flag.String("ports", tunnelclient.DefaultPortSpec, "allowlist of forwardable ports (comma-separated, ranges like 3000-3099); 'all' disables the gate (DANGEROUS — exposes every localhost port to the Internet)")
@@ -45,11 +44,6 @@ func main() {
 	}
 	if *identityKey == "" {
 		*identityKey = defaultIdentityKey()
-	}
-	// SWE_TUNNEL_STATE_FILE overrides the flag default but loses to an
-	// explicitly-set --state-file. Empty string disables.
-	if envSF, ok := os.LookupEnv("SWE_TUNNEL_STATE_FILE"); ok && !flagSet("state-file") {
-		*stateFile = envSF
 	}
 	if envRF, ok := os.LookupEnv("SWE_TUNNEL_REPORT_FORMAT"); ok && !flagSet("report-format") {
 		*reportFormat = envRF
@@ -94,21 +88,6 @@ func main() {
 		tlsCfg = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // user opted in
 	}
 
-	postRegister := func(sess *tunnelclient.Session) error {
-		if *stateFile == "" {
-			return nil
-		}
-		if err := tunnelclient.WriteState(*stateFile, sess); err != nil {
-			// Best-effort: the tunnel still works without a state file.
-			// Consumers that need it (e.g. swe-swe's public-hostname
-			// resolver) will fall through to env/flag defaults.
-			logger.Warn("write state file", "path", *stateFile, "err", err)
-			return err
-		}
-		logger.Info("wrote state file", "path", *stateFile, "hostname", sess.Hostname())
-		return nil
-	}
-
 	runErr := tunnelclient.Run(ctx, tunnelclient.RunOptions{
 		Connect: tunnelclient.Options{
 			ServerURL:  *server,
@@ -118,8 +97,7 @@ func main() {
 			Logger:     logger,
 			Emitter:    emitter,
 		},
-		Handler:      tunnelclient.PortDispatchHandler(*target, policy, logger),
-		PostRegister: postRegister,
+		Handler: tunnelclient.PortDispatchHandler(*target, policy, logger),
 	})
 	if runErr != nil {
 		logger.Error("run", "err", runErr)
