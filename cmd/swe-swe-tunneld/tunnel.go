@@ -83,9 +83,10 @@ func (r *registry) get(label string) *tunnelSession {
 //  1. validate Upgrade headers, hijack, write 101 Switching Protocols
 //  2. yamux.Server, accept stream 1
 //  3. read Register, verify Ed25519 sig + clock skew + unique shape
-//  4. apply per-IP and per-pubkey rate limits
-//  5. lookup identity store; on first registration, EnsureName issues the
-//     per-session cert in-line. On reclaim, run Challenge/Proof.
+//  4. apply per-IP rate limit (cheap, before crypto)
+//  5. lookup identity store; on first registration, apply per-pubkey
+//     rate limit (anti-hoarding) and EnsureName issues the per-session
+//     cert in-line. On reclaim, run Challenge/Proof.
 //  6. send RegisterOK, register session, block until session.Close
 func connectHandler(
 	reg *registry,
@@ -272,21 +273,23 @@ func handleRegister(
 		return registerResult{}, false
 	}
 
-	// Per-pubkey rate limit (sig is verified now, so the pubkey claim is
-	// honest). Cap how many distinct uniques one keypair can register/day.
-	if pubkeyLimiter != nil && !pubkeyLimiter.Allow(string(pub)) {
-		logger.Warn("register denied: pubkey rate limit", "remote", remoteAddr, "unique", reg.Unique)
-		sendDeny(stream, "rate_limited:pubkey")
-		return registerResult{}, false
-	}
-
 	label := control.TunnelLabel(reg.Unique)
 
 	existing, err := store.Get(ctx, reg.Unique)
 	switch {
 	case errors.Is(err, identity.ErrNotFound):
-		// New unique → claim it. Issue cert FIRST (may fail; if so, the
-		// store stays clean).
+		// New unique → claim it. The per-pubkey rate limit applies only
+		// here (anti-hoarding: cap how many distinct uniques one keypair
+		// can register/day). Idempotent reconnects to an already-owned
+		// unique do not consume the budget — they allocate no new
+		// resource. The IP rate limit (above) still throttles
+		// connect-spam regardless.
+		if pubkeyLimiter != nil && !pubkeyLimiter.Allow(string(pub)) {
+			logger.Warn("register denied: pubkey rate limit", "remote", remoteAddr, "unique", reg.Unique)
+			sendDeny(stream, "rate_limited:pubkey")
+			return registerResult{}, false
+		}
+		// Issue cert FIRST (may fail; if so, the store stays clean).
 		if err := certMgr.EnsureName(ctx, label); err != nil {
 			logger.Error("ensure-cert failed for new register",
 				"unique", reg.Unique, "label", label, "remote", remoteAddr, "err", err)

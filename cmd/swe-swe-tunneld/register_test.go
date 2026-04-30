@@ -402,6 +402,90 @@ func TestHandleRegister_PerPubkeyRateLimit(t *testing.T) {
 	expectDeny(t, h, "rate_limited:pubkey")
 }
 
+// Idempotent reconnect (existing unique, same pubkey) must NOT consume a
+// per-pubkey rate-limit slot — the budget exists to cap how many new uniques
+// a keypair can claim, not how often a tunnel can reconnect.
+func TestHandleRegister_IdempotentReconnect_DoesNotConsumePubkeyBudget(t *testing.T) {
+	h := newRegHarness(t)
+	_, priv := newKey(t)
+	pub := priv.Public().(ed25519.PublicKey)
+	if err := h.store.Put(context.Background(), "alpha", pub, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	// Capacity 1, already exhausted: a new-unique attempt would be denied.
+	h.keyLim = ratelimit.New(1, 24*time.Hour)
+	_ = h.keyLim.Allow(string(pub))
+	h.start()
+
+	h.sendRegister("alpha", priv, time.Now().Unix())
+	res := h.awaitResult()
+	if !res.ok || res.res.newRegistration {
+		t.Fatalf("idempotent reconnect denied or flipped newRegistration: %+v ok=%v", res.res, res.ok)
+	}
+}
+
+// Challenge/proof flow (existing unique, different pubkey) must NOT consume a
+// per-pubkey slot for the *connecting* key. The IP limit still throttles, and
+// Proof verification is the cryptographic gate.
+func TestHandleRegister_ChallengeFlow_DoesNotConsumePubkeyBudget(t *testing.T) {
+	h := newRegHarness(t)
+	_, ownerPriv := newKey(t)
+	if err := h.store.Put(context.Background(), "alpha",
+		ownerPriv.Public().(ed25519.PublicKey), time.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	_, attackerPriv := newKey(t)
+	attackerPub := attackerPriv.Public().(ed25519.PublicKey)
+	// Capacity 1, already exhausted for the attacker's key.
+	h.keyLim = ratelimit.New(1, 24*time.Hour)
+	_ = h.keyLim.Allow(string(attackerPub))
+	h.start()
+
+	h.sendRegister("alpha", attackerPriv, time.Now().Unix())
+
+	// The attacker's pubkey budget is exhausted, but the limiter must not be
+	// consulted on this code path: server should reach Challenge.
+	chFrame := h.expectKind(control.KindChallenge)
+	var ch control.Challenge
+	_ = control.DecodePayload(chFrame, &ch)
+	nonce, _ := base64.RawStdEncoding.DecodeString(ch.Nonce)
+
+	// Sign with the attacker's wrong key — Proof will fail with key_mismatch,
+	// which is the proper defense (cryptographic, not rate-limit).
+	proofSig := ed25519.Sign(attackerPriv, control.ProofSigningPayload(nonce))
+	_ = control.WriteMessage(h.client, control.KindProof, control.Proof{
+		Sig: base64.RawStdEncoding.EncodeToString(proofSig),
+	})
+	expectDeny(t, h, "key_mismatch")
+}
+
+// New-unique attempts under the same key still count: 11 fresh uniques with
+// budget 10 must produce one rate_limited:pubkey deny.
+func TestHandleRegister_NewUniques_StillCountTowardPubkeyBudget(t *testing.T) {
+	_, priv := newKey(t)
+	keyLim := ratelimit.New(10, 24*time.Hour)
+
+	// First 10 fresh uniques succeed.
+	for i := 0; i < 10; i++ {
+		h := newRegHarness(t)
+		h.keyLim = keyLim
+		h.start()
+		unique := "u" + string(rune('a'+i)) + "x"
+		h.sendRegister(unique, priv, time.Now().Unix())
+		res := h.awaitResult()
+		if !res.ok {
+			t.Fatalf("attempt %d (unique=%s) denied: %+v", i+1, unique, res)
+		}
+	}
+	// 11th must be rate-limited (budget exhausted).
+	h := newRegHarness(t)
+	h.keyLim = keyLim
+	h.start()
+	h.sendRegister("ulast", priv, time.Now().Unix())
+	expectDeny(t, h, "rate_limited:pubkey")
+}
+
 // --------------------------------------------------------------------------
 // Cert ensurer failure
 // --------------------------------------------------------------------------
