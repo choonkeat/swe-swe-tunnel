@@ -38,7 +38,8 @@ type Server struct {
 	registers atomic.Int32
 
 	mu        sync.Mutex
-	killAfter int // 1-indexed nth registration to drop after RegisterOK
+	killAfter int      // 1-indexed nth registration to drop after RegisterOK
+	denyQueue []string // FIFO of Deny.Reason strings to send on the next Register frames
 	logf      func(format string, args ...any)
 }
 
@@ -129,6 +130,31 @@ func (s *Server) KillNextSession() {
 	s.killAfter = int(s.registers.Load()) + 1
 }
 
+// DenyNextRegister queues a Deny.Reason to send back on the next
+// incoming Register frame instead of RegisterOK. Calls stack: each
+// queued reason is consumed in FIFO order. After the queue drains,
+// subsequent Registers succeed normally.
+//
+// Used by tests that exercise the client's deny-handling paths
+// (rate-limit backoff, permanent-fatal exit).
+func (s *Server) DenyNextRegister(reason string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.denyQueue = append(s.denyQueue, reason)
+}
+
+// nextDenyReason pops one queued deny reason; ok=false means none queued.
+func (s *Server) nextDenyReason() (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.denyQueue) == 0 {
+		return "", false
+	}
+	r := s.denyQueue[0]
+	s.denyQueue = s.denyQueue[1:]
+	return r, true
+}
+
 func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method", http.StatusMethodNotAllowed)
@@ -188,6 +214,14 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	var reg control.Register
 	if err := control.DecodePayload(frame, &reg); err != nil {
 		s.logf("tunneldfake: decode register: %v", err)
+		return
+	}
+	if reason, ok := s.nextDenyReason(); ok {
+		if err := control.WriteMessage(stream, control.KindDeny, control.Deny{
+			Reason: reason,
+		}); err != nil {
+			s.logf("tunneldfake: write deny: %v", err)
+		}
 		return
 	}
 	hostname := control.TunnelLabel(reg.Unique) + "." + s.apex

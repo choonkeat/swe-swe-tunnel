@@ -2,6 +2,7 @@ package tunnelclient
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -33,6 +34,14 @@ type RunOptions struct {
 
 	// BackoffMax caps the reconnect delay. Zero defaults to 30s.
 	BackoffMax time.Duration
+
+	// RateLimitFloor is the minimum delay used after a server Deny with
+	// reason "rate_limited:*". The default exponential schedule is
+	// useless against the server's per-IP (1h) and per-pubkey (24h)
+	// windows, so we floor at a longer wait. Zero defaults to 5min.
+	// Commit-2 will override this with a server-supplied retry_after
+	// when present.
+	RateLimitFloor time.Duration
 
 	// MaxAttempts caps consecutive connect failures before Run gives up
 	// and emits `fatal`. Zero means unlimited (default production
@@ -69,6 +78,10 @@ func Run(ctx context.Context, ro RunOptions) error {
 	if backoffMax <= 0 {
 		backoffMax = 30 * time.Second
 	}
+	rateLimitFloor := ro.RateLimitFloor
+	if rateLimitFloor <= 0 {
+		rateLimitFloor = 5 * time.Minute
+	}
 	deregTimeout := ro.DeregisterTimeout
 	if deregTimeout <= 0 {
 		deregTimeout = 5 * time.Second
@@ -91,6 +104,19 @@ func Run(ctx context.Context, ro RunOptions) error {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return nil
 			}
+			// Permanent server denies (bad pubkey, bad sig, key_mismatch,
+			// version mismatch, invalid unique, ...) cannot be fixed by
+			// retrying — emit `fatal` and exit instead of pinging the
+			// server forever.
+			var denyErr *DenyError
+			if errors.As(err, &denyErr) && denyErr.IsPermanent() {
+				em.Emit(EventFatal, FatalData{
+					Message:  fmt.Sprintf("permanent server deny: %v", err),
+					ExitCode: 1,
+				})
+				return err
+			}
+
 			em.Emit(EventError, ErrorData{Message: err.Error(), Retryable: true})
 			if ro.MaxAttempts > 0 && attempt >= ro.MaxAttempts {
 				em.Emit(EventFatal, FatalData{
@@ -99,7 +125,15 @@ func Run(ctx context.Context, ro RunOptions) error {
 				})
 				return err
 			}
+			// rate_limited:* denies override the exponential schedule
+			// with a longer floor — see RunOptions.RateLimitFloor for
+			// rationale. Hammering on a 30s ceiling against the server's
+			// hour- and day-scale windows just burns budget without
+			// progress.
 			delay := backoffDuration(attempt, backoffMin, backoffMax)
+			if errors.As(err, &denyErr) && denyErr.IsRateLimit() && delay < rateLimitFloor {
+				delay = rateLimitFloor
+			}
 			attempt++
 			em.Emit(EventReconnecting, ReconnectingData{
 				AfterMs: int(delay / time.Millisecond),

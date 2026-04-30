@@ -7,6 +7,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -277,6 +278,198 @@ func TestE2E_Run_FatalAfterMaxAttempts(t *testing.T) {
 	}
 	if !sawError {
 		t.Errorf("expected at least one error event before fatal, got %v", kinds)
+	}
+}
+
+// TestE2E_Run_PermanentDenyEmitsFatal asserts that a server Deny with a
+// reason DenyError.IsPermanent() recognises (here: "bad pubkey") causes
+// Run to emit `fatal` and return immediately, rather than looping
+// against a server that will reject every retry the same way.
+func TestE2E_Run_PermanentDenyEmitsFatal(t *testing.T) {
+	f := newFakeTunneld(t)
+	f.DenyNextRegister("bad pubkey")
+
+	cap := &captureBuffer{}
+	em := NewJSONLEmitter(cap)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	err := Run(ctx, RunOptions{
+		Connect: Options{
+			ServerURL:  f.URL(),
+			Unique:     "perma",
+			PrivateKey: freshKey(t),
+			TLSConfig:  f.TLSConfig(),
+			Logger:     logger,
+			Emitter:    em,
+		},
+		Handler:    http.NotFoundHandler(),
+		BackoffMin: 5 * time.Millisecond,
+		BackoffMax: 10 * time.Millisecond,
+		// MaxAttempts intentionally 0 (unlimited) — this test asserts the
+		// permanent-deny path bypasses retries even with MaxAttempts=∞.
+	})
+	if err == nil {
+		t.Fatal("Run: want non-nil error on permanent deny, got nil")
+	}
+	var denyErr *DenyError
+	if !errors.As(err, &denyErr) {
+		t.Errorf("Run error did not wrap *DenyError: %v", err)
+	} else if denyErr.Reason != "bad pubkey" {
+		t.Errorf("DenyError.Reason = %q, want %q", denyErr.Reason, "bad pubkey")
+	}
+
+	kinds := readEventKinds(t, cap.Bytes())
+	if last := kinds[len(kinds)-1]; last != EventFatal {
+		t.Errorf("last event = %q, want %q. Stream:\n%s", last, EventFatal, cap.Bytes())
+	}
+	// Must NOT have emitted retryable error or reconnecting — the run
+	// loop should bail before scheduling a retry.
+	for _, k := range kinds {
+		if k == EventReconnecting {
+			t.Errorf("permanent deny path emitted %q (run loop should not retry)", k)
+		}
+	}
+	// Server must have seen exactly one Register attempt.
+	if got := f.Registrations(); got != 0 {
+		// Note: Registrations() counts successful RegisterOKs, not Register
+		// frames received. We expect 0 because the fake denied the only
+		// attempt. The count being >0 would indicate the loop re-attempted.
+		t.Errorf("Registrations() = %d on permanent-deny path, want 0", got)
+	}
+}
+
+// TestE2E_Run_RateLimitDenyUsesLongFloor asserts that a server Deny with
+// reason "rate_limited:ip" overrides the exponential schedule with the
+// configured RateLimitFloor — the run loop's `reconnecting.after_ms`
+// must reflect the floor, not the millisecond-scale BackoffMax.
+func TestE2E_Run_RateLimitDenyUsesLongFloor(t *testing.T) {
+	f := newFakeTunneld(t)
+	f.DenyNextRegister("rate_limited:ip")
+	// Subsequent attempts succeed so the loop progresses past the deny.
+
+	cap := &captureBuffer{}
+	em := NewJSONLEmitter(cap)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// 250ms floor is long enough to be visible against a 10ms BackoffMax
+	// but short enough to keep this test fast.
+	const floor = 250 * time.Millisecond
+
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- Run(ctx, RunOptions{
+			Connect: Options{
+				ServerURL:  f.URL(),
+				Unique:     "ratelim",
+				PrivateKey: freshKey(t),
+				TLSConfig:  f.TLSConfig(),
+				Logger:     logger,
+				Emitter:    em,
+			},
+			Handler:        http.NotFoundHandler(),
+			BackoffMin:     5 * time.Millisecond,
+			BackoffMax:     10 * time.Millisecond,
+			RateLimitFloor: floor,
+		})
+	}()
+
+	waitForKind(t, cap, EventRegisterOK, 5*time.Second)
+	cancel()
+	select {
+	case <-runDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run didn't return after cancel")
+	}
+
+	// Inspect the reconnecting event that followed the deny: its
+	// after_ms must be >= floor (in ms), not the 10ms BackoffMax.
+	sc := bufio.NewScanner(bytes.NewReader(cap.Bytes()))
+	var sawFloorBackoff bool
+	for sc.Scan() {
+		line := bytes.TrimSpace(sc.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		var ev struct {
+			Kind string                 `json:"kind"`
+			Data map[string]interface{} `json:"data"`
+		}
+		if err := json.Unmarshal(line, &ev); err != nil {
+			t.Fatalf("invalid JSON line %q: %v", line, err)
+		}
+		if ev.Kind != EventReconnecting {
+			continue
+		}
+		afterMsRaw, ok := ev.Data["after_ms"]
+		if !ok {
+			t.Fatalf("reconnecting event missing after_ms: %s", line)
+		}
+		afterMs, ok := afterMsRaw.(float64)
+		if !ok {
+			t.Fatalf("reconnecting.after_ms is not a number: %v", afterMsRaw)
+		}
+		floorMs := float64(floor / time.Millisecond)
+		if afterMs >= floorMs {
+			sawFloorBackoff = true
+			break
+		}
+	}
+	if !sawFloorBackoff {
+		t.Errorf("expected a reconnecting event with after_ms >= %dms (the rate-limit floor), but none seen. Stream:\n%s",
+			floor/time.Millisecond, cap.Bytes())
+	}
+}
+
+// TestE2E_Run_NonRateLimitDenyUsesExponential confirms the floor only
+// kicks in for rate_limited:* — a transient non-rate-limit deny (e.g.
+// "store error") must still use the normal exponential schedule, not
+// the long floor, so transient server hiccups recover quickly.
+func TestE2E_Run_NonRateLimitDenyUsesExponential(t *testing.T) {
+	f := newFakeTunneld(t)
+	f.DenyNextRegister("store error")
+
+	cap := &captureBuffer{}
+	em := NewJSONLEmitter(cap)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Long floor — if the run loop wrongly treated "store error" as a
+	// rate-limit, the test would block on this floor and fail the
+	// 2-second waitForKind below.
+	const floor = 30 * time.Second
+
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- Run(ctx, RunOptions{
+			Connect: Options{
+				ServerURL:  f.URL(),
+				Unique:     "transient",
+				PrivateKey: freshKey(t),
+				TLSConfig:  f.TLSConfig(),
+				Logger:     logger,
+				Emitter:    em,
+			},
+			Handler:        http.NotFoundHandler(),
+			BackoffMin:     5 * time.Millisecond,
+			BackoffMax:     20 * time.Millisecond,
+			RateLimitFloor: floor,
+		})
+	}()
+
+	waitForKind(t, cap, EventRegisterOK, 2*time.Second)
+	cancel()
+	select {
+	case <-runDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run didn't return after cancel")
 	}
 }
 

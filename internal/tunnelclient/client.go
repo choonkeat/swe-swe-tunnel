@@ -31,6 +31,49 @@ import (
 	"github.com/choonkeat/swe-swe-tunnel/internal/control"
 )
 
+// DenyError wraps a server-sent Deny.Reason. Connect and Deregister
+// return one of these when the server replies with a Deny frame; the
+// Run loop pulls it out via errors.As to make backoff and retry
+// decisions per reason (rate-limit → long delay; permanent → fatal).
+type DenyError struct {
+	// Reason is the raw Deny.Reason string from the wire.
+	Reason string
+	// Op is "register" or "deregister", whichever flow surfaced this.
+	Op string
+}
+
+// Error formats the deny for human-readable error chains.
+func (e *DenyError) Error() string {
+	if e.Op != "" {
+		return fmt.Sprintf("server denied %s: %s", e.Op, e.Reason)
+	}
+	return fmt.Sprintf("server denied: %s", e.Reason)
+}
+
+// IsRateLimit reports whether the deny is one of the server's
+// rate_limited:* reasons (currently :ip and :pubkey).
+func (e *DenyError) IsRateLimit() bool {
+	return strings.HasPrefix(e.Reason, "rate_limited:")
+}
+
+// IsPermanent reports whether the deny reason is a client-side
+// configuration error that retrying cannot fix. Callers should treat
+// these as fatal rather than looping.
+func (e *DenyError) IsPermanent() bool {
+	switch e.Reason {
+	case "bad pubkey", "bad sig", "key_mismatch", "unique mismatch",
+		"bad register payload", "bad deregister payload",
+		"bad proof payload", "bad proof sig", "signature invalid":
+		return true
+	}
+	if strings.HasPrefix(e.Reason, "unsupported protocol version") ||
+		strings.HasPrefix(e.Reason, "invalid unique") ||
+		strings.HasPrefix(e.Reason, "expected ") {
+		return true
+	}
+	return false
+}
+
 // Options configures a single Connect call.
 type Options struct {
 	// ServerURL is the tunneld base URL, e.g. "https://tunnel.example.com".
@@ -260,7 +303,7 @@ func (s *Session) Deregister(ctx context.Context) error {
 	case control.KindDeny:
 		var d control.Deny
 		_ = control.DecodePayload(frame, &d)
-		return fmt.Errorf("server denied deregister: %s", d.Reason)
+		return &DenyError{Reason: d.Reason, Op: "deregister"}
 	default:
 		return fmt.Errorf("unexpected frame %q in Deregister response", frame.Type)
 	}
@@ -389,7 +432,7 @@ func registerWithServer(stream io.ReadWriter, unique string, priv ed25519.Privat
 	case control.KindDeny:
 		var d control.Deny
 		_ = control.DecodePayload(frame, &d)
-		return "", fmt.Errorf("server denied: %s", d.Reason)
+		return "", &DenyError{Reason: d.Reason, Op: "register"}
 	default:
 		return "", fmt.Errorf("unexpected frame type %q", frame.Type)
 	}
