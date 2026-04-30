@@ -98,7 +98,8 @@ Renewal:
 
 Rate-limit awareness:
 - LE: 50 new "Registered Domain" certs per `example.com` per week. New REGISTER calls are the constraint; renewals don't count.
-- Document a back-pressure mode if the limit is hit (return 503 from REGISTER with retry-after).
+- Per-pubkey rate limit (10/day, see "Squatting and rate limits") sits **before** the cert-issuance call in the new-unique branch, so a runaway client can't burn through the LE quota even if its keypair is compromised.
+- The back-pressure mode is implemented over the typed `Deny` frame: rate-limit denies carry `retry_after_seconds` so the client can wait the precise window. The client behavior section below describes how supervisors react.
 - Consider weekly capacity headroom when picking client onboarding cadence.
 
 LE account:
@@ -151,10 +152,11 @@ Note: PROOF must be signed by the **stored** private key, not the new one. An im
 
 ### Squatting and rate limits
 
-- Per-IP REGISTER rate limit: 5/hour, sliding window.
-- Per-source-pubkey REGISTER rate limit: 10/day across all uniques.
-- DEREGISTER is unrestricted but requires PROOF.
-- Identity records are persistent; no TTL. Squatted names stay squatted unless the owner DEREGISTERs.
+- **Per-IP REGISTER rate limit:** 5/hour, sliding window. Cheap, applied before any crypto. Counts every REGISTER attempt with a valid frame shape.
+- **Per-pubkey REGISTER rate limit:** 10/day, sliding window. Anti-hoarding: caps how many *new* uniques one keypair can claim. Idempotent reconnects to an already-owned unique do **not** consume the budget — they allocate no new resource. The challenge/proof path (registering against an existing unique with a different pubkey) also doesn't consume the budget; the cryptographic Proof verification is the gate there.
+- **Server hint on rate-limit denies.** The Deny frame for `rate_limited:ip` and `rate_limited:pubkey` carries `retry_after_seconds` — the exact time until the offending sliding window's oldest sample expires (rounded up by one second). New clients use this to back off precisely; old clients ignore the field.
+- **DEREGISTER is unrestricted** but requires PROOF.
+- **Identity records are persistent;** no TTL. Squatted names stay squatted unless the owner DEREGISTERs.
 
 ### Identity storage
 
@@ -397,31 +399,88 @@ HTTP/1.1 traffic.
 [4 bytes big-endian length][JSON payload, UTF-8, ≤ 64 KiB]
 ```
 
-### Phase 2 messages
+### Frame envelope
+
+Each frame is a typed envelope:
 
 ```
-ClientHello = { "version": 1, "unique": "abc" }
-
-ServerHello = { "ok": true,  "hostname": "abc-tunnel.example.com" }
-            | { "ok": false, "reason": "<human-readable>" }
+{ "type": "<kind>", "payload": { ... } }
 ```
 
-### Phase 3 additions (planned)
+`type` is one of: `register`, `register_ok`, `challenge`, `proof`, `deny`,
+`deregister`, `deregister_ok`. The Phase 2 untyped `ClientHello`/`ServerHello`
+is retired.
+
+### Frame payloads
 
 ```
-ClientHello = { "version": 1, "unique": "abc",
-                "pubkey":  "Ed25519:base64...",
-                "timestamp": 1714137600,
-                "sig":     "Ed25519(pubkey || unique || timestamp)" }
+Register     = { "version": 1, "unique": "abc",
+                 "pubkey":   "base64-RawStd Ed25519 (32 bytes)",
+                 "timestamp": 1714137600,
+                 "sig":       "base64-RawStd Ed25519(domain || pubkey || unique || ts)" }
 
-ServerChallenge = { "type": "challenge", "nonce": "base64..." }
-ClientProof     = { "type": "proof",     "sig":   "Ed25519(stored_pubkey, nonce)" }
+RegisterOK   = { "hostname": "abc-tunnel.example.com" }
 
-ClientDeregister = { "type": "deregister", "sig": "base64..." }
+Challenge    = { "nonce": "base64-RawStd, 32 bytes" }
+Proof        = { "sig":   "base64-RawStd Ed25519(stored_priv, domain || nonce)" }
+
+Deregister   = { "unique": "abc",
+                 "timestamp": 1714137600,
+                 "sig":       "base64-RawStd Ed25519(domain || unique || ts)" }
+DeregisterOK = {}
 ```
 
-DENY conditions surface as `ServerHello{ok:false, reason:"rate_limited" |
-"key_mismatch" | "invalid_unique" | ...}`.
+### Deny
+
+`Deny` is the terminal failure reply on Register, Deregister, and the
+post-Register control loop. Two fields:
+
+```
+Deny = { "reason":              "<machine-readable string>",
+         "retry_after_seconds": <int, omitted when 0> }
+```
+
+Reason taxonomy (current strings; treat as enum from the client's
+perspective, but match by exact string):
+
+| Reason | Semantics | Client should |
+|---|---|---|
+| `rate_limited:ip` | Per-IP REGISTER limit hit | Wait `retry_after_seconds` (or `RateLimitFloor`, default 5min, if absent) |
+| `rate_limited:pubkey` | Per-pubkey REGISTER limit hit on a new-unique claim | Same as above |
+| `bad pubkey`, `bad sig`, `signature invalid`, `key_mismatch`, `unique mismatch`, `bad register payload`, `bad deregister payload`, `bad proof payload`, `bad proof sig` | Client misconfiguration | Treat as fatal (no retry) |
+| `unsupported protocol version <n>`, `invalid unique <q>`, `expected <kind>, got <kind>` | Wire-format incompatibility | Treat as fatal |
+| `timestamp out of range` | Clock skew vs. server | Retry (skew may be transient) |
+| `cert issuance failed`, `store error`, `internal error` | Server-side transient | Retry with normal exponential backoff |
+
+`retry_after_seconds` is set only on `rate_limited:*` denies; clients
+seeing zero on any deny fall back to local heuristics
+(`RateLimitFloor` for rate-limits, exponential for everything else).
+Old clients that don't read the field are unaffected (the `omitempty`
+JSON tag means it's wire-compatible both directions).
+
+### Client retry behavior
+
+The reference client (`internal/tunnelclient.Run`) dispatches on
+deny reason:
+
+* **Permanent denies** (per the table above) → emit `fatal` and exit
+  non-zero. Looping on these forever just turns a misconfiguration
+  into a noisy reconnect storm; the supervisor should surface the
+  fatal and let the operator fix the config.
+* **`rate_limited:*` denies** → the next reconnect waits
+  `retry_after_seconds` if present, else `RunOptions.RateLimitFloor`
+  (default 5min). The default exponential ceiling (`BackoffMax = 30s`)
+  is useless against the server's hour- and day-scale windows;
+  pinging at 30s just keeps the offending budget exhausted.
+* **Transient denies** (clock skew, server-side hiccups) → normal
+  exponential backoff, capped at `BackoffMax`.
+* **All non-deny errors** (TCP refused, TLS failure, yamux) → normal
+  exponential backoff.
+
+The supervisor JSONL stream surfaces these as `error` (retryable),
+`reconnecting` (with `after_ms`), and `fatal` (with `exit_code`)
+events. See `tasks/2026-04-29-supervisor-event-protocol.md` for
+the full event schema.
 
 ### Forwarded streams
 
