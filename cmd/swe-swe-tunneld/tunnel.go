@@ -333,6 +333,18 @@ func handleRegister(
 		if err := certMgr.EnsureName(ctx, label); err != nil {
 			logger.Error("ensure-cert failed for new register",
 				"unique", reg.Unique, "label", label, "remote", remoteAddr, "err", err)
+			// Refund the IP and pubkey budget tokens we consumed above:
+			// cert issuance failed for server-side reasons (ACME / DNS
+			// propagation / LE rate limit), nothing the client did. Without
+			// this refund a transient cert flake would lock the operator's
+			// IP and key out for a full window — a self-inflicted DoS each
+			// time DNSimple's edge is slow.
+			if ipLimiter != nil {
+				ipLimiter.CancelLatest(ipKey)
+			}
+			if pubkeyLimiter != nil {
+				pubkeyLimiter.CancelLatest(string(pub))
+			}
 			sendDeny(stream, "cert issuance failed")
 			return registerResult{}, false
 		}

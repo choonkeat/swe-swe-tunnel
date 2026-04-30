@@ -111,6 +111,34 @@ func (s *SlidingWindow) AllowAt(key string, now time.Time) bool {
 	return true
 }
 
+// CancelLatest reverses the most recent Allow(key) call by removing one
+// timestamp from the window. Used when a request that the limiter admitted
+// ultimately fails for reasons unrelated to the caller — e.g., server-side
+// cert issuance — so a transient flake doesn't burn the caller's budget.
+//
+// No-op when the window is empty for key (e.g., already pruned out, or
+// CancelLatest was called more than Allow). The latest sample is
+// indistinguishable from any other in-window sample for budgeting purposes,
+// so this safely tolerates concurrent Allow/CancelLatest races: at worst,
+// one concurrent Allow's slot is refunded instead of the failed one's, and
+// budget arithmetic stays correct.
+func (s *SlidingWindow) CancelLatest(key string) {
+	if s.max <= 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	samples := s.seen[key]
+	if len(samples) == 0 {
+		return
+	}
+	if len(samples) == 1 {
+		delete(s.seen, key)
+		return
+	}
+	s.seen[key] = samples[:len(samples)-1]
+}
+
 // Prune walks the map and removes entries whose timestamp lists are entirely
 // older than the window. Call this periodically from a background goroutine if
 // the key cardinality is unbounded.

@@ -288,6 +288,82 @@ func TestSlidingWindow_RunPruner_StopsOnContextCancel(t *testing.T) {
 	}
 }
 
+func TestSlidingWindow_CancelLatest_RefundsBudget(t *testing.T) {
+	lim := New(2, time.Hour)
+	t0 := time.Unix(1714137600, 0)
+
+	if !lim.AllowAt("k", t0) {
+		t.Fatal("1 should be allowed")
+	}
+	if !lim.AllowAt("k", t0.Add(10*time.Minute)) {
+		t.Fatal("2 should be allowed")
+	}
+	// Window full — 3rd would be denied.
+	if lim.AllowAt("k", t0.Add(20*time.Minute)) {
+		t.Fatal("3rd should be denied at full window")
+	}
+
+	// Refund the latest. Now 2/2 → 1/2 used, so a fresh attempt fits.
+	lim.CancelLatest("k")
+	if !lim.AllowAt("k", t0.Add(20*time.Minute)) {
+		t.Error("after CancelLatest, the next Allow should fit in spare capacity")
+	}
+}
+
+func TestSlidingWindow_CancelLatest_NoOpWhenEmpty(t *testing.T) {
+	lim := New(3, time.Hour)
+	// Cancelling an absent key must not panic and must not poison the map.
+	lim.CancelLatest("never-seen")
+	if got := lim.Size(); got != 0 {
+		t.Errorf("Size after cancel of unknown key = %d, want 0", got)
+	}
+	// Cancel more times than Allow — still fine.
+	lim.AllowAt("k", time.Unix(1, 0))
+	lim.CancelLatest("k")
+	lim.CancelLatest("k") // extra cancel, no-op
+	if got := lim.Size(); got != 0 {
+		t.Errorf("Size after over-cancel = %d, want 0", got)
+	}
+}
+
+func TestSlidingWindow_CancelLatest_DistinctKeys(t *testing.T) {
+	lim := New(1, time.Hour)
+	t0 := time.Unix(1714137600, 0)
+	_ = lim.AllowAt("a", t0)
+	_ = lim.AllowAt("b", t0)
+	// Cancelling on "a" must not refund "b".
+	lim.CancelLatest("a")
+	if lim.AllowAt("b", t0) {
+		t.Error("CancelLatest('a') must not free budget on 'b'")
+	}
+	if !lim.AllowAt("a", t0) {
+		t.Error("CancelLatest('a') should free budget on 'a'")
+	}
+}
+
+func TestSlidingWindow_CancelLatest_DisabledNoOp(t *testing.T) {
+	lim := New(0, time.Hour) // disabled
+	// CancelLatest on a disabled limiter is a benign no-op (no map entries
+	// were ever recorded; just confirm we don't panic).
+	lim.CancelLatest("k")
+}
+
+func TestSlidingWindow_CancelLatest_AffectsRetryAfter(t *testing.T) {
+	lim := New(2, time.Hour)
+	t0 := time.Unix(1714137600, 0)
+	_ = lim.AllowAt("k", t0)
+	_ = lim.AllowAt("k", t0.Add(10*time.Minute))
+	// Full window: RetryAfter is positive.
+	if d := lim.RetryAfterAt("k", t0.Add(10*time.Minute)); d == 0 {
+		t.Fatal("expected non-zero RetryAfter at full window")
+	}
+	lim.CancelLatest("k")
+	// Now 1/2 used → spare capacity → RetryAfter must be 0.
+	if d := lim.RetryAfterAt("k", t0.Add(10*time.Minute)); d != 0 {
+		t.Errorf("RetryAfter after CancelLatest = %v, want 0 (spare capacity)", d)
+	}
+}
+
 func TestSlidingWindow_Concurrent(t *testing.T) {
 	lim := New(100, time.Hour)
 	var wg sync.WaitGroup

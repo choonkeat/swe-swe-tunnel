@@ -505,6 +505,57 @@ func TestHandleRegister_CertEnsurerFails_NoStore(t *testing.T) {
 	}
 }
 
+// A server-side cert flake (DNS / ACME / LE rate limit) must not spend the
+// caller's IP and pubkey budget. Otherwise a string of cert failures
+// caused by something the operator didn't control (e.g. DNSimple edge
+// propagation) will lock the operator out for a full window — a
+// self-inflicted DoS on top of the underlying flake. Confirm both
+// budgets are intact after a "cert issuance failed" deny.
+func TestHandleRegister_CertEnsurerFails_RefundsBothBudgets(t *testing.T) {
+	h := newRegHarness(t)
+	// Tight budgets so a single un-refunded burn would deny the next attempt.
+	h.ipLim = ratelimit.New(1, time.Hour)
+	h.keyLim = ratelimit.New(1, 24*time.Hour)
+	h.ensurer.err = errors.New("ACME outage")
+	h.start()
+
+	_, priv := newKey(t)
+	pub := priv.Public().(ed25519.PublicKey)
+	h.sendRegister("alpha", priv, time.Now().Unix())
+	expectDeny(t, h, "cert issuance failed")
+
+	// Both budgets must show spare capacity (RetryAfter == 0) — i.e. the
+	// failed attempt was refunded, not held against the IP or the key.
+	if d := h.ipLim.RetryAfter("127.0.0.1"); d != 0 {
+		t.Errorf("ipLim.RetryAfter = %v after cert flake, want 0 (token refunded)", d)
+	}
+	if d := h.keyLim.RetryAfter(string(pub)); d != 0 {
+		t.Errorf("keyLim.RetryAfter = %v after cert flake, want 0 (token refunded)", d)
+	}
+}
+
+// Sanity: refund must not leak across keys — the IP refund on a cert flake
+// shouldn't free unrelated other-IP budget. We exercise this by pre-loading
+// a separate IP's budget and verifying it's unaffected by our flake.
+func TestHandleRegister_CertEnsurerFails_RefundIsKeyScoped(t *testing.T) {
+	h := newRegHarness(t)
+	h.ipLim = ratelimit.New(1, time.Hour)
+	_ = h.ipLim.Allow("10.0.0.99") // pre-consume an unrelated IP's slot
+	h.keyLim = ratelimit.New(1, 24*time.Hour)
+	h.ensurer.err = errors.New("ACME outage")
+	h.start()
+
+	_, priv := newKey(t)
+	h.sendRegister("alpha", priv, time.Now().Unix())
+	expectDeny(t, h, "cert issuance failed")
+
+	// The cert-failure refund must not touch 10.0.0.99 — that IP should
+	// still be exhausted.
+	if d := h.ipLim.RetryAfter("10.0.0.99"); d == 0 {
+		t.Error("unrelated IP budget freed by cert-failure refund — refund leaked across keys")
+	}
+}
+
 // --------------------------------------------------------------------------
 // helpers
 // --------------------------------------------------------------------------
