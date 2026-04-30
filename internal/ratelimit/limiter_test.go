@@ -1,6 +1,8 @@
 package ratelimit
 
 import (
+	"context"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -164,6 +166,125 @@ func TestSlidingWindow_RetryAfter_AgreesWithAllow(t *testing.T) {
 	}
 	if d := lim.RetryAfterAt("k", t0.Add(20*time.Minute)); d <= 0 {
 		t.Errorf("RetryAfter on denied call = %v, want > 0", d)
+	}
+}
+
+// TestSlidingWindow_KeyCapBounded verifies the security fix for the
+// memory-exhaustion DoS: with a cap of N, an attacker submitting M >> N
+// distinct keys cannot grow Size() past N. Without this cap a single
+// IPv6 /64 source pool would let an attacker OOM the server.
+func TestSlidingWindow_KeyCapBounded(t *testing.T) {
+	lim := New(5, time.Hour)
+	lim.SetMaxKeys(50)
+	t0 := time.Unix(1714137600, 0)
+
+	// Insert 1000 distinct keys; samples never age out within this
+	// window so pruning can't recover slots.
+	for i := 0; i < 1000; i++ {
+		lim.AllowAt(fmt.Sprintf("ip-%d", i), t0)
+	}
+	if got := lim.Size(); got > 50 {
+		t.Errorf("Size = %d, want <= 50 (cap)", got)
+	}
+}
+
+// TestSlidingWindow_KeyCapPrunesFirst checks the cap path's behavior
+// when keys have aged out: the cheap prune sweep should free slots
+// without forcing eviction of live keys. This means a steady stream of
+// short-lived keys doesn't constantly evict each other.
+func TestSlidingWindow_KeyCapPrunesFirst(t *testing.T) {
+	lim := New(5, time.Hour)
+	lim.SetMaxKeys(10)
+	t0 := time.Unix(1714137600, 0)
+
+	// Fill with 10 keys at t0 (cap reached but not yet exceeded).
+	for i := 0; i < 10; i++ {
+		lim.AllowAt(fmt.Sprintf("old-%d", i), t0)
+	}
+	if got := lim.Size(); got != 10 {
+		t.Fatalf("setup: Size = %d, want 10", got)
+	}
+
+	// 90 minutes later, all 10 are aged out (window=1h). Inserting a
+	// new key should trigger the prune sweep, dropping all 10 and
+	// admitting the new one without eviction pressure.
+	lim.AllowAt("fresh", t0.Add(90*time.Minute))
+	if got := lim.Size(); got != 1 {
+		t.Errorf("Size after insert past expiry = %d, want 1 (10 stale pruned)", got)
+	}
+}
+
+// TestSlidingWindow_KeyCapZeroDisablesCap is the escape hatch: setting
+// the cap to <=0 must restore the old unbounded behavior. Tests that
+// rely on the legacy semantic shouldn't need rewriting just because
+// the default cap is now finite.
+func TestSlidingWindow_KeyCapZeroDisablesCap(t *testing.T) {
+	lim := New(5, time.Hour)
+	lim.SetMaxKeys(0)
+	t0 := time.Unix(1714137600, 0)
+	for i := 0; i < 500; i++ {
+		lim.AllowAt(fmt.Sprintf("k-%d", i), t0)
+	}
+	if got := lim.Size(); got != 500 {
+		t.Errorf("Size = %d, want 500 (cap disabled)", got)
+	}
+}
+
+// TestSlidingWindow_RunPruner_DropsAgedKeys ensures the production
+// janitor goroutine actually shrinks the map. Without RunPruner being
+// wired from main, idle keys live forever even with the cap (the cap
+// only triggers on insert pressure).
+func TestSlidingWindow_RunPruner_DropsAgedKeys(t *testing.T) {
+	// Use a real wall-clock window short enough that the test finishes
+	// quickly. now is the wall clock; we can't override mid-test
+	// because RunPruner uses time.Ticker. Use a 50ms window and a
+	// 20ms prune interval — fast enough for CI but >0 to make the
+	// scheduler happy.
+	lim := New(5, 50*time.Millisecond)
+
+	// Insert 100 keys at "now"; they age out 50ms later.
+	for i := 0; i < 100; i++ {
+		lim.Allow(fmt.Sprintf("k-%d", i))
+	}
+	if lim.Size() != 100 {
+		t.Fatalf("setup: Size=%d, want 100", lim.Size())
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go lim.RunPruner(ctx, 20*time.Millisecond)
+
+	// Wait for one full prune cycle past expiry.
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if lim.Size() == 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := lim.Size(); got != 0 {
+		t.Errorf("Size after expiry + prune ticks = %d, want 0", got)
+	}
+}
+
+// TestSlidingWindow_RunPruner_StopsOnContextCancel verifies the
+// goroutine exits cleanly — otherwise restarting the server in tests
+// or under hot-reload would leak goroutines.
+func TestSlidingWindow_RunPruner_StopsOnContextCancel(t *testing.T) {
+	lim := New(5, time.Hour)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	done := make(chan struct{})
+	go func() {
+		lim.RunPruner(ctx, 10*time.Millisecond)
+		close(done)
+	}()
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("RunPruner did not exit within 1s of ctx cancel")
 	}
 }
 

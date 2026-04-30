@@ -114,7 +114,16 @@ func main() {
 	logger.Info("register rate limits",
 		"ip_per_hour", *registerIPLimit,
 		"pubkey_per_day", *registerKeyLimit,
+		"max_keys", ratelimit.DefaultMaxKeys,
 	)
+
+	// Periodic janitor: drops keys whose sample windows have entirely
+	// aged out. Without this the per-IP and per-pubkey maps grow without
+	// bound when source addresses or keys keep rotating (DoS vector via
+	// IPv6 source-address rotation). 15min cadence is well below the 1h
+	// window and cheap (single map iteration).
+	go ipLim.RunPruner(ctx, 15*time.Minute)
+	go keyLim.RunPruner(ctx, 15*time.Minute)
 
 	reg := newRegistry()
 
