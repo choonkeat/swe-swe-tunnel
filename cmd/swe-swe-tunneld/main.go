@@ -70,7 +70,26 @@ func main() {
 		os.Exit(2)
 	}
 
-	mgr := cert.New(*stateDir, *email, *apex, dnsProviderFactory(*dnsProv, *dnsPropagationTimeout, *dnsPollingInterval), logger)
+	// Wrap the lego DNS provider with our authoritative-NS pre-check so
+	// Present blocks until every authoritative NS for the apex actually
+	// serves the TXT we wrote — otherwise lego signals LE prematurely on
+	// a slow DNSimple edge and burns LE's "60 failed validations / hour"
+	// budget. See internal/cert/precheck.go for full rationale.
+	baseFactory := dnsProviderFactory(*dnsProv, *dnsPropagationTimeout, *dnsPollingInterval)
+	providerFactory := func() (challenge.Provider, error) {
+		inner, err := baseFactory()
+		if err != nil {
+			return nil, err
+		}
+		return &cert.AuthoritativePreCheck{
+			Inner:        inner,
+			Apex:         *apex,
+			WaitTimeout:  *dnsPropagationTimeout,
+			WaitInterval: *dnsPollingInterval,
+			Logger:       logger,
+		}, nil
+	}
+	mgr := cert.New(*stateDir, *email, *apex, providerFactory, logger)
 	if *staging {
 		mgr.SetStaging()
 		logger.Info("ACME staging mode (browser will not trust the cert)")
