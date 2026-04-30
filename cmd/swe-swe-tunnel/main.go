@@ -70,7 +70,7 @@ func main() {
 		os.Exit(2)
 	}
 
-	priv, err := tunnelclient.LoadOrCreateIdentity(*identityKey, logger)
+	priv, err := tunnelclient.LoadIdentity(*identityKey, logger)
 	if err != nil {
 		logger.Error("identity key", "path", *identityKey, "err", err)
 		emitter.Emit(tunnelclient.EventFatal, tunnelclient.FatalData{
