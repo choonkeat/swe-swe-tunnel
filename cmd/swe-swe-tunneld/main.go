@@ -38,6 +38,15 @@ func main() {
 		ensureCert       = flag.String("ensure-cert", "", "issue *.{label}.{apex} cert and exit (admin one-shot)")
 		registerIPLimit  = flag.Int("register-rate-ip-per-hour", 5, "max REGISTER attempts per source IP per hour (0 = disabled)")
 		registerKeyLimit = flag.Int("register-rate-pubkey-per-day", 10, "max REGISTER attempts per pubkey per day (0 = disabled)")
+		// Lego's defaults (PropagationTimeout=60s, PollingInterval=2s) are
+		// too tight for DNSimple's edge nameservers under load — we've seen
+		// real-world TXT propagation occasionally take 2–4 minutes, which
+		// burns LE failed-validation budget on otherwise-healthy issuance.
+		// 5min/5s is a comfortable ceiling: still recovers fast on a normal
+		// day, rides out an edge hiccup without telling LE to validate
+		// prematurely.
+		dnsPropagationTimeout = flag.Duration("dns-propagation-timeout", 5*time.Minute, "DNS-01 TXT propagation timeout passed to lego provider")
+		dnsPollingInterval    = flag.Duration("dns-polling-interval", 5*time.Second, "DNS-01 TXT propagation poll interval")
 	)
 	flag.Parse()
 
@@ -61,7 +70,7 @@ func main() {
 		os.Exit(2)
 	}
 
-	mgr := cert.New(*stateDir, *email, *apex, dnsProviderFactory(*dnsProv), logger)
+	mgr := cert.New(*stateDir, *email, *apex, dnsProviderFactory(*dnsProv, *dnsPropagationTimeout, *dnsPollingInterval), logger)
 	if *staging {
 		mgr.SetStaging()
 		logger.Info("ACME staging mode (browser will not trust the cert)")
@@ -171,10 +180,24 @@ func helloHandler(apex string) http.Handler {
 	return mux
 }
 
-func dnsProviderFactory(name string) func() (challenge.Provider, error) {
+// dnsProviderFactory returns a closure that constructs a fresh challenge.Provider
+// per cert request. propagationTimeout / pollingInterval override the lego
+// defaults, which are too tight for DNSimple's edge under load.
+func dnsProviderFactory(name string, propagationTimeout, pollingInterval time.Duration) func() (challenge.Provider, error) {
 	switch name {
 	case "dnsimple":
-		return func() (challenge.Provider, error) { return dnsimple.NewDNSProvider() }
+		return func() (challenge.Provider, error) {
+			cfg := dnsimple.NewDefaultConfig()
+			cfg.AccessToken = os.Getenv("DNSIMPLE_OAUTH_TOKEN")
+			cfg.BaseURL = os.Getenv("DNSIMPLE_BASE_URL")
+			if propagationTimeout > 0 {
+				cfg.PropagationTimeout = propagationTimeout
+			}
+			if pollingInterval > 0 {
+				cfg.PollingInterval = pollingInterval
+			}
+			return dnsimple.NewDNSProviderConfig(cfg)
+		}
 	default:
 		return func() (challenge.Provider, error) {
 			return nil, fmt.Errorf("unsupported dns provider %q (only dnsimple in phase 1)", name)
