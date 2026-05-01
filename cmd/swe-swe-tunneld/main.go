@@ -190,7 +190,7 @@ func helloHandler(apex string) http.Handler {
 			return
 		}
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		fmt.Fprintf(w, "swe-swe-tunnel server\napex: %s\nphase: 2 (control channel + reverse proxy)\n", apex)
+		fmt.Fprintf(w, "swe-swe-tunnel\napex: %s\nhttps://github.com/choonkeat/swe-swe-tunnel\n", apex)
 	})
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
