@@ -32,6 +32,7 @@ import (
 	"github.com/go-acme/lego/v4/challenge"
 	"github.com/go-acme/lego/v4/lego"
 	"github.com/go-acme/lego/v4/registration"
+	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -54,6 +55,19 @@ type Manager struct {
 	entries  map[string]*certEntry // baseName → entry
 	exact    map[string]*certEntry // exact-match SAN → entry
 	wildcard map[string]*certEntry // wildcard parent (e.g. "example.com") → entry
+
+	// issueGroup coalesces concurrent ensureSANs calls for the same
+	// baseName. Without it, two parallel Register attempts for the same
+	// `unique` each kick off a full ACME flow against Let's Encrypt;
+	// the parallel TXT-record cleanup steps step on each other and one
+	// of the flows fails with "no TXT record found." See bug 2 in
+	// commit ceba11d's parent log.
+	issueGroup singleflight.Group
+
+	// obtainOverride, if non-nil, replaces the real ACME-backed obtain
+	// in ensureSANs. Only set in tests; production constructs a Manager
+	// via New, which leaves it nil.
+	obtainOverride func(ctx context.Context, sans []string, baseName string) (*tls.Certificate, error)
 
 	logger *slog.Logger
 }
@@ -192,6 +206,10 @@ func (m *Manager) ensureSANs(ctx context.Context, sans []string, baseName string
 		return fmt.Errorf("mkdir account dir: %w", err)
 	}
 
+	// Fast path: cert is already on disk and fresh. Outside the
+	// singleflight group so a quiescent in-process restart that hits
+	// EnsureName(label) for many already-issued labels doesn't
+	// serialize behind one singleflight key per label.
 	if cert, ok, err := m.loadCertFile(baseName); err != nil {
 		return err
 	} else if ok && expiresIn(cert) > renewBefore {
@@ -202,13 +220,36 @@ func (m *Manager) ensureSANs(ctx context.Context, sans []string, baseName string
 		return nil
 	}
 
-	m.logger.Info("issuing cert", "sans", sans, "ca", m.CADirURL)
-	cert, err := m.obtain(ctx, sans, baseName)
-	if err != nil {
-		return fmt.Errorf("obtain cert %v: %w", sans, err)
-	}
-	m.addEntry(&certEntry{cert: cert, sans: sans, baseName: baseName})
-	return nil
+	// Slow path: needs an ACME flow. Coalesce concurrent callers for
+	// the same baseName into a single in-flight Issue so retries
+	// during in-flight cert issuance don't fire parallel ACME flows
+	// (which race each other's TXT-record cleanup and waste LE quota).
+	_, err, _ := m.issueGroup.Do(baseName, func() (any, error) {
+		// Re-check disk inside the group: a concurrent leader may
+		// have just landed it. If so, take that and skip ACME.
+		if cert, ok, err := m.loadCertFile(baseName); err != nil {
+			return nil, err
+		} else if ok && expiresIn(cert) > renewBefore {
+			m.logger.Info("loaded existing cert from disk",
+				"base", baseName,
+				"expires_in", expiresIn(cert).Round(time.Hour))
+			m.addEntry(&certEntry{cert: cert, sans: dnsNamesFromCert(cert), baseName: baseName})
+			return nil, nil
+		}
+
+		m.logger.Info("issuing cert", "sans", sans, "ca", m.CADirURL)
+		obtain := m.obtain
+		if m.obtainOverride != nil {
+			obtain = m.obtainOverride
+		}
+		cert, err := obtain(ctx, sans, baseName)
+		if err != nil {
+			return nil, fmt.Errorf("obtain cert %v: %w", sans, err)
+		}
+		m.addEntry(&certEntry{cert: cert, sans: sans, baseName: baseName})
+		return nil, nil
+	})
+	return err
 }
 
 func (m *Manager) checkAndRenew(ctx context.Context) {

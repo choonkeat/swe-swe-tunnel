@@ -1,16 +1,20 @@
 package cert
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"math/big"
 	"os"
 	"path/filepath"
 	"slices"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -171,6 +175,178 @@ func TestManager_LoadAllFromDisk_SkipsBrokenFiles(t *testing.T) {
 	}
 	if n != 1 {
 		t.Errorf("loaded count = %d, want 1 (broken cert should be skipped)", n)
+	}
+}
+
+// TestManager_EnsureName_SingleflightCoalescesConcurrentCalls verifies that
+// N concurrent EnsureName calls for the same label only invoke the underlying
+// obtain (ACME flow) once. Without singleflight, parallel ACME flows race
+// each other's TXT-record cleanup and one fails — see bug 2.
+func TestManager_EnsureName_SingleflightCoalescesConcurrentCalls(t *testing.T) {
+	m := New(t.TempDir(), "test@example.com", "example.com", nil, nil)
+
+	const N = 8
+	var calls atomic.Int32
+	release := make(chan struct{})
+	entered := make(chan struct{}, N)
+
+	m.obtainOverride = func(ctx context.Context, sans []string, baseName string) (*tls.Certificate, error) {
+		calls.Add(1)
+		entered <- struct{}{}
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		return makeCert(t, sans...), nil
+	}
+
+	var wg sync.WaitGroup
+	errs := make(chan error, N)
+	for i := 0; i < N; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- m.EnsureName(context.Background(), "alpha")
+		}()
+	}
+
+	// Wait for at least one obtain to be in-flight, then give the other
+	// goroutines a moment to pile up behind the singleflight key. (If
+	// singleflight is broken and all N enter obtain, the counter races
+	// past 1 here.)
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("no obtain call observed within 2s")
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	close(release)
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		if err != nil {
+			t.Errorf("EnsureName: %v", err)
+		}
+	}
+	if got := calls.Load(); got != 1 {
+		t.Errorf("obtain called %d times, want 1 (singleflight should coalesce)", got)
+	}
+}
+
+// TestManager_EnsureName_SingleflightDoesNotCacheResults verifies that a
+// second EnsureName call AFTER the first completes invokes obtain again.
+// singleflight.Do (vs. DoChan-with-Forget or memoization) only coalesces
+// in-flight callers; sequential callers should still hit the slow path
+// (where the disk-fast-path will normally save them, but here there's no
+// cert on disk because our override doesn't persist).
+func TestManager_EnsureName_SingleflightDoesNotCacheResults(t *testing.T) {
+	m := New(t.TempDir(), "test@example.com", "example.com", nil, nil)
+
+	var calls atomic.Int32
+	m.obtainOverride = func(ctx context.Context, sans []string, baseName string) (*tls.Certificate, error) {
+		calls.Add(1)
+		return makeCert(t, sans...), nil
+	}
+
+	for i := 0; i < 3; i++ {
+		if err := m.EnsureName(context.Background(), "alpha"); err != nil {
+			t.Fatalf("call %d: %v", i, err)
+		}
+	}
+	if got := calls.Load(); got != 3 {
+		t.Errorf("obtain called %d times, want 3 (sequential calls should not be cached)", got)
+	}
+}
+
+// TestManager_EnsureName_DifferentLabelsRunInParallel verifies that
+// singleflight keys on baseName, so EnsureName("alpha") and
+// EnsureName("beta") do not block each other.
+func TestManager_EnsureName_DifferentLabelsRunInParallel(t *testing.T) {
+	m := New(t.TempDir(), "test@example.com", "example.com", nil, nil)
+
+	release := make(chan struct{})
+	entered := make(chan string, 2)
+
+	m.obtainOverride = func(ctx context.Context, sans []string, baseName string) (*tls.Certificate, error) {
+		entered <- baseName
+		<-release
+		return makeCert(t, sans...), nil
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); _ = m.EnsureName(context.Background(), "alpha") }()
+	go func() { defer wg.Done(); _ = m.EnsureName(context.Background(), "beta") }()
+
+	// Both should reach obtain concurrently. If singleflight were
+	// keyed too coarsely (e.g. on a constant), we'd see only one
+	// entry within the timeout and the test would hang/fail.
+	got := map[string]bool{}
+	for i := 0; i < 2; i++ {
+		select {
+		case bn := <-entered:
+			got[bn] = true
+		case <-time.After(2 * time.Second):
+			t.Fatalf("only %d obtain call(s) entered within 2s; want 2 (different labels should not coalesce)", i)
+		}
+	}
+	close(release)
+	wg.Wait()
+
+	if !got["_.alpha.example.com"] || !got["_.beta.example.com"] {
+		t.Errorf("entered = %v, want both _.alpha.example.com and _.beta.example.com", got)
+	}
+}
+
+// TestManager_EnsureName_SingleflightSurfacesError verifies that when the
+// singleflight leader returns an error, all coalesced waiters see it.
+func TestManager_EnsureName_SingleflightSurfacesError(t *testing.T) {
+	m := New(t.TempDir(), "test@example.com", "example.com", nil, nil)
+
+	wantErr := errors.New("acme blew up")
+	var calls atomic.Int32
+	release := make(chan struct{})
+	entered := make(chan struct{}, 1)
+
+	m.obtainOverride = func(ctx context.Context, sans []string, baseName string) (*tls.Certificate, error) {
+		if calls.Add(1) == 1 {
+			entered <- struct{}{}
+			<-release
+		}
+		return nil, wantErr
+	}
+
+	const N = 4
+	var wg sync.WaitGroup
+	errs := make(chan error, N)
+	for i := 0; i < N; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- m.EnsureName(context.Background(), "alpha")
+		}()
+	}
+
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("no obtain call observed within 2s")
+	}
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		if err == nil || !errors.Is(err, wantErr) {
+			t.Errorf("EnsureName err = %v, want wrapped %v", err, wantErr)
+		}
+	}
+	if got := calls.Load(); got != 1 {
+		t.Errorf("obtain called %d times, want 1", got)
 	}
 }
 
