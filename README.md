@@ -48,6 +48,7 @@ go build -o bin/swe-swe-tunnel ./cmd/swe-swe-tunnel
 | `--ensure-cert` | — | (off) | no | Admin one-shot: issue `*.{label}.{apex}` and exit. |
 | `--register-rate-ip-per-hour` | — | `5` | no | Per-IP REGISTER limit. `0` disables. |
 | `--register-rate-pubkey-per-day` | — | `10` | no | Per-pubkey REGISTER limit. `0` disables. |
+| `--allowlist-dir` | `SWE_TUNNEL_ALLOWLIST_DIR` | (off) | no | Directory of authorized pubkey files; gates Register. See "Access control" below. |
 
 DNS-provider credentials are read from the lego provider's standard env vars (e.g. `DNSIMPLE_OAUTH_TOKEN` for `dnsimple`, `CF_API_TOKEN` for cloudflare, etc.).
 
@@ -140,6 +141,72 @@ The choice of ACME DNS-01 provider is **independent** of the apex DNS host's wil
 Compatible with the standalone `lego` CLI layout — you can inspect or operate on cert state with `lego` directly if needed.
 
 The client persists `~/.swe-swe-tunnel/identity.key` (Ed25519 PKCS8 PEM, mode 0600).
+
+## Access control: pubkey allowlist
+
+By default, anyone who can reach `:443/v1/connect` can register a fresh keypair under any unclaimed `unique` and consume an LE issuance. For a friends-and-family deployment that's usually fine; the per-IP and per-pubkey rate limits keep blast radius small. For more control, the daemon supports an optional Ed25519 pubkey **allowlist** that gates `Register` after signature verification.
+
+### Enabling
+
+Pass `--allowlist-dir=<path>` (or set `SWE_TUNNEL_ALLOWLIST_DIR`). The directory contains one or more files; each file holds zero or more base64-RawStd Ed25519 pubkeys, one per line, with `#` comments and blank lines ignored. Filenames are free-form labels — `alice-laptop.pub`, `bob.pub`, `ci-runner.pub`. Dotfiles and subdirectories are ignored.
+
+```sh
+mkdir -p ./allowlist
+printf '%s  # alice@laptop\n' "$ALICE_PUB_BASE64" > ./allowlist/alice-laptop.pub
+swe-swe-tunneld --apex-domain=example.com ... --allowlist-dir=./allowlist
+```
+
+Three states, distinguishable in the boot log:
+
+| Setting | Behavior | Boot log |
+|---|---|---|
+| flag unset | open registration (default) | `allowlist disabled (no --allowlist-dir set; open registration)` |
+| flag set, dir empty | **deny everyone** (explicit operator intent) | `allowlist loaded (deny-all) ... files=0 count=0` |
+| flag set, N keys | allow those N | `allowlist loaded ... files=F count=N` |
+
+Boot fails loud (`exit 1`) if any file in the directory is malformed — silently falling back to open-registration would defeat the operator's intent.
+
+### Adding / removing keys without a restart
+
+Edit the directory on disk, then signal SIGHUP:
+
+```sh
+# Add — drop a file in:
+printf '%s  # alice@laptop\n' "$NEW_PUB" > ./allowlist/alice-laptop.pub
+# Remove — delete the file:
+rm ./allowlist/alice-laptop.pub
+# Signal reload + revoke:
+kill -HUP $(pidof swe-swe-tunneld)
+```
+
+On a successful SIGHUP reload the daemon logs `allowlist reloaded ... added=N removed=M` and **immediately closes any live yamux sessions whose pubkey is no longer authorized**. The client's reconnect loop then receives `not_authorized` on retry and the supervisor stops. A reload that fails to parse keeps the prior in-memory set in place (with `keeping_previous=true` in the log) and does **not** drop sessions — a typo'd file mid-flight should not flip the gate to deny-all.
+
+### Docker workflow
+
+The shipped `docker-compose.yml` already bind-mounts `./allowlist/` (directory, not file — single-file mounts pin the container to one inode and break atomic writes / `cp` overwrites). To enable the gate, add to your `.env`:
+
+```
+SWE_TUNNEL_ALLOWLIST_DIR=/etc/swe-swe-tunneld/allowlist
+```
+
+Then drop key files into `./allowlist/` and signal:
+
+```sh
+docker kill -s HUP swe-swe-tunneld
+docker logs --tail 5 swe-swe-tunneld   # expect "allowlist reloaded ..."
+```
+
+### Why gate after signature verification
+
+A peer who can't sign for the claimed pubkey gets `signature invalid` regardless of allowlist membership — they learn nothing about the list. A peer who *can* sign but isn't allowlisted gets `not_authorized`: this is intentional disclosure to legitimate key holders so an operator can tell a friend "send me your boot fingerprint, I'll add it." The deny log carries `pubkey_fp=<12hex>` so the operator can correlate.
+
+### Out of scope (deferred follow-ups)
+
+- Bearer-token gate on the HTTP upgrade (cheap DoS filter, layerable in front)
+- Per-key permissions (which `unique` a key may claim, expiry, labels)
+- Web/admin UI — the directory is the API
+- fsnotify watcher to remove the manual SIGHUP step
+- Pending-approval queue (operator approves out-of-band)
 
 ## Deregister (graceful release)
 

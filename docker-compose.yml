@@ -8,6 +8,15 @@ services:
       - "443:443"
     volumes:
       - tunnel-data:/var/lib/swe-swe-tunnel
+      # Bind-mount the allowlist *directory* (not a single file). A
+      # bind-mounted file pins the container's view to one inode; an
+      # editor that writes via temp+rename — or `cp` over an existing
+      # target — leaves the daemon looking at a now-unlinked file
+      # forever. Mounting the directory means dropping/removing
+      # files on the host shows up immediately on the next reload.
+      # `:ro` constrains only the container — the host can still
+      # edit freely.
+      - ./allowlist:/etc/swe-swe-tunneld/allowlist:ro
     environment:
       DNSIMPLE_OAUTH_TOKEN: ${DNSIMPLE_OAUTH_TOKEN:?required}
       SWE_TUNNEL_APEX: ${SWE_TUNNEL_APEX:?required}
@@ -15,6 +24,20 @@ services:
       # Set via env (not command:) so it also covers `compose run` invocations
       # that override the entrypoint args (e.g. --ensure-cert).
       SWE_TUNNEL_STATE: /var/lib/swe-swe-tunnel
+      # Optional: gate Register on a pubkey allowlist. Default unset
+      # → registration is open (today's behavior). To enable, set
+      # SWE_TUNNEL_ALLOWLIST_DIR in your .env (the directory is
+      # already bind-mounted above):
+      #
+      #   SWE_TUNNEL_ALLOWLIST_DIR=/etc/swe-swe-tunneld/allowlist
+      #
+      # Then drop one *.pub file per friend into ./allowlist/ and
+      # signal a reload+revoke with:
+      #
+      #   docker kill -s HUP swe-swe-tunneld
+      #
+      # An empty directory with the env set means deny-all.
+      SWE_TUNNEL_ALLOWLIST_DIR: ${SWE_TUNNEL_ALLOWLIST_DIR:-}
     command:
       - --listen=:443
 

@@ -158,6 +158,18 @@ Note: PROOF must be signed by the **stored** private key, not the new one. An im
 - **DEREGISTER is unrestricted** but requires PROOF.
 - **Identity records are persistent;** no TTL. Squatted names stay squatted unless the owner DEREGISTERs.
 
+### Allowlist (optional access control)
+
+Rate limits throttle abuse but do not stop it — a determined stranger with a handful of source IPs can still register names under the operator's apex and consume Let's Encrypt issuance budget. For deployments that want a hard gate, swe-swe-tunneld supports an optional Ed25519 pubkey allowlist:
+
+- `--allowlist-dir=<path>` (env: `SWE_TUNNEL_ALLOWLIST_DIR`). When unset, registration is open (default). When set, only keys present in some file under the directory may register; an empty directory means deny-all.
+- The gate sits in `handleRegister` immediately *after* `ed25519.Verify` succeeds and before the per-pubkey rate limit / cert ensure / store write. Running the gate after sig verification means a peer who doesn't hold the private key gets `signature invalid` regardless of allowlist membership — they learn nothing about the list. A legitimate signer whose key isn't on the list gets `not_authorized`, intentional disclosure so the operator can be told "send me your boot fingerprint."
+- SIGHUP reloads the directory and immediately closes any live yamux session whose pubkey is no longer authorized (live revoke). The reload runs `RevokeMissing` only on a successful parse — a malformed file mid-flight keeps the prior in-memory set, so a typo can't flip the gate to deny-all.
+- `RevokeMissing` collects victim sessions under the registry's RLock then `Close()`s them outside the lock — yamux `Close` writes a GoAway frame and waits briefly for ACK, so blocking `add`/`remove` callers behind that would stall the control plane during a reload.
+- Operator workflow on a containerised deployment: bind-mount the directory (not a single file — bind-mounted files pin the container to one inode and break atomic-write editors and `cp` overwrites), drop/remove `*.pub` files on the host, then `docker kill -s HUP swe-swe-tunneld`. No container recreation, no `/run-production` re-run.
+
+See `tasks/2026-05-02-pubkey-allowlist.md` for the full design rationale and the four-commit landing sequence.
+
 ### Identity storage
 
 SQLite file `identities.db`:
