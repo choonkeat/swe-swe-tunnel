@@ -33,6 +33,18 @@ type certEnsurer interface {
 	EnsureName(ctx context.Context, label string) error
 }
 
+// identityStore is the subset of *identity.Store that handleRegister needs.
+// Kept as an interface so tests can inject a stub that simulates the
+// concurrent-Register race — Get→ErrNotFound followed by Put→ErrAlreadyExists
+// — without needing two real goroutines and SQLite serialization timing.
+// *identity.Store satisfies it.
+type identityStore interface {
+	Get(ctx context.Context, unique string) (identity.Entry, error)
+	Put(ctx context.Context, unique string, pubkey ed25519.PublicKey, now time.Time) error
+	Touch(ctx context.Context, unique string, now time.Time) error
+	Rotate(ctx context.Context, unique string, newPubkey ed25519.PublicKey, now time.Time) error
+}
+
 // maxClockSkew bounds the acceptable distance between client-reported
 // timestamps and server time. Bigger window = easier replay; smaller window =
 // brittle to clock drift.
@@ -315,7 +327,7 @@ type registerResult struct {
 func handleRegister(
 	ctx context.Context,
 	stream io.ReadWriter,
-	store *identity.Store,
+	store identityStore,
 	certMgr certEnsurer,
 	ipLimiter *ratelimit.SlidingWindow,
 	pubkeyLimiter *ratelimit.SlidingWindow,
@@ -448,6 +460,36 @@ func handleRegister(
 			return registerResult{}, false
 		}
 		if err := store.Put(ctx, reg.Unique, pub, now); err != nil {
+			// Concurrent-Register race: a parallel claim for the same
+			// unique committed first. Without this fallback the loser
+			// would have replied "store error" and disconnected, which
+			// the client retries — and the retry loop is exactly the
+			// flapping behaviour bug 2's singleflight is meant to
+			// stop. Re-Get and decide based on the now-visible row:
+			// same pubkey → idempotent reconnect; different pubkey →
+			// key_mismatch (caller should run the Challenge/Proof
+			// flow on its next attempt, not retry blind).
+			if errors.Is(err, identity.ErrAlreadyExists) {
+				existing, getErr := store.Get(ctx, reg.Unique)
+				if getErr != nil {
+					logger.Error("identity get-after-conflict failed",
+						"unique", reg.Unique, "err", getErr)
+					sendDeny(stream, "store error")
+					return registerResult{}, false
+				}
+				if !bytes.Equal(existing.Pubkey, pub) {
+					logger.Warn("register denied: race lost to different pubkey",
+						"unique", reg.Unique, "remote", remoteAddr,
+						"pubkey_fp", fingerprint(pub))
+					sendDeny(stream, "key_mismatch")
+					return registerResult{}, false
+				}
+				logger.Info("identity put race: reconciled as idempotent reconnect",
+					"unique", reg.Unique, "remote", remoteAddr,
+					"pubkey_fp", fingerprint(pub))
+				_ = store.Touch(ctx, reg.Unique, now)
+				return registerResult{unique: reg.Unique, label: label, newRegistration: false, pubkey: pub}, true
+			}
 			logger.Error("identity put failed", "unique", reg.Unique, "err", err)
 			sendDeny(stream, "store error")
 			return registerResult{}, false

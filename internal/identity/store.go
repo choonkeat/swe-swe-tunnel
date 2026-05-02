@@ -15,8 +15,15 @@ import (
 	"fmt"
 	"time"
 
-	_ "modernc.org/sqlite"
+	"modernc.org/sqlite"
 )
+
+// sqliteConstraint is the base result code for SQLITE_CONSTRAINT (19).
+// Extended codes like SQLITE_CONSTRAINT_PRIMARYKEY (1555) carry this in
+// their low byte, so masking with 0xFF covers both the base and extended
+// forms — and avoids pulling the heavyweight modernc.org/sqlite/lib
+// constants table into our dependency surface.
+const sqliteConstraint = 19
 
 // Entry is a row from the identities table.
 type Entry struct {
@@ -28,6 +35,14 @@ type Entry struct {
 
 // ErrNotFound is returned by Get when no row matches.
 var ErrNotFound = errors.New("identity not found")
+
+// ErrAlreadyExists is returned by Put when a row for the given unique is
+// already present (PRIMARY KEY conflict). Callers that care about the
+// concurrent-Register race — two parallel claims for the same unique whose
+// Get→ErrNotFound checks both pass before either Put commits — use this
+// to fall back to a re-Get + idempotency check rather than failing the
+// session with "store error".
+var ErrAlreadyExists = errors.New("identity already exists")
 
 // Store wraps the underlying database connection.
 type Store struct {
@@ -92,8 +107,8 @@ func (s *Store) Get(ctx context.Context, unique string) (Entry, error) {
 	}, nil
 }
 
-// Put inserts a fresh ownership record. Returns an error if the unique already
-// exists (UNIQUE constraint on PRIMARY KEY).
+// Put inserts a fresh ownership record. Returns ErrAlreadyExists (wrapped)
+// if a row for unique is already present.
 func (s *Store) Put(ctx context.Context, unique string, pubkey ed25519.PublicKey, now time.Time) error {
 	if len(pubkey) != ed25519.PublicKeySize {
 		return fmt.Errorf("put: pubkey wrong size %d", len(pubkey))
@@ -103,6 +118,10 @@ func (s *Store) Put(ctx context.Context, unique string, pubkey ed25519.PublicKey
 		unique, []byte(pubkey), now.Unix(), now.Unix(),
 	)
 	if err != nil {
+		var sErr *sqlite.Error
+		if errors.As(err, &sErr) && sErr.Code()&0xFF == sqliteConstraint {
+			return fmt.Errorf("put %q: %w", unique, ErrAlreadyExists)
+		}
 		return fmt.Errorf("put %q: %w", unique, err)
 	}
 	return nil

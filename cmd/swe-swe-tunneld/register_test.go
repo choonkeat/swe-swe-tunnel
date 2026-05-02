@@ -49,16 +49,17 @@ func (f *fakeEnsurer) Calls() []string {
 // store, swap limiters, or set ensurer.err; finally start() launches the
 // handleRegister goroutine.
 type regHarness struct {
-	t        *testing.T
-	server   net.Conn
-	client   net.Conn
-	store    *identity.Store
-	ensurer  *fakeEnsurer
-	ipLim    *ratelimit.SlidingWindow
-	keyLim   *ratelimit.SlidingWindow
-	allow    *allowlist.Set // nil = gate disabled (current behavior)
-	resultCh chan handleResult
-	logBuf   *bytes.Buffer
+	t             *testing.T
+	server        net.Conn
+	client        net.Conn
+	store         *identity.Store
+	storeOverride identityStore // non-nil → used instead of h.store (race tests)
+	ensurer       *fakeEnsurer
+	ipLim         *ratelimit.SlidingWindow
+	keyLim        *ratelimit.SlidingWindow
+	allow         *allowlist.Set // nil = gate disabled (current behavior)
+	resultCh      chan handleResult
+	logBuf        *bytes.Buffer
 }
 
 type handleResult struct {
@@ -98,9 +99,13 @@ func (h *regHarness) start() {
 		h.logBuf = &bytes.Buffer{}
 	}
 	logger := slog.New(slog.NewTextHandler(h.logBuf, nil))
+	var store identityStore = h.store
+	if h.storeOverride != nil {
+		store = h.storeOverride
+	}
 	go func() {
 		res, ok := handleRegister(context.Background(), h.server,
-			h.store, h.ensurer, h.ipLim, h.keyLim, h.allow, logger, "127.0.0.1:54321")
+			store, h.ensurer, h.ipLim, h.keyLim, h.allow, logger, "127.0.0.1:54321")
 		h.resultCh <- handleResult{res: res, ok: ok}
 	}()
 }
@@ -737,6 +742,166 @@ func expectDenyContains(t *testing.T, h *regHarness, substr string) {
 	res := h.awaitResult()
 	if res.ok {
 		t.Error("handleRegister returned ok=true on deny path")
+	}
+}
+
+// --------------------------------------------------------------------------
+// Concurrent-Register race fallback (bug 3)
+//
+// When two parallel Register attempts both pass Get→ErrNotFound, exactly
+// one Put commits and the other lands on ErrAlreadyExists. The loser
+// re-Gets, compares the visible row's pubkey to the connecting one, and
+// either succeeds idempotently (same key) or denies key_mismatch
+// (different key). These tests use a stub identityStore to drive the
+// race deterministically — exercising the fallback branch without
+// relying on goroutine timing or SQLite serialization.
+// --------------------------------------------------------------------------
+
+// raceStore is a stub identityStore that returns ErrNotFound from the
+// first Get, ErrAlreadyExists from Put, and a caller-supplied entry
+// from any Get after Put. Mirrors what a real *identity.Store does
+// when a parallel claim has just committed between the first Get and
+// our Put.
+type raceStore struct {
+	mu          sync.Mutex
+	gets        int
+	puts        int
+	touches     int
+	rotates     int
+	winnerEntry identity.Entry // returned by Get after Put
+	getErr      error          // forced error from Get-after-Put (default: nil)
+}
+
+func (r *raceStore) Get(_ context.Context, unique string) (identity.Entry, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.gets++
+	if r.gets == 1 {
+		return identity.Entry{}, identity.ErrNotFound
+	}
+	if r.getErr != nil {
+		return identity.Entry{}, r.getErr
+	}
+	return r.winnerEntry, nil
+}
+
+func (r *raceStore) Put(_ context.Context, _ string, _ ed25519.PublicKey, _ time.Time) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.puts++
+	return identity.ErrAlreadyExists
+}
+
+func (r *raceStore) Touch(_ context.Context, _ string, _ time.Time) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.touches++
+	return nil
+}
+
+func (r *raceStore) Rotate(_ context.Context, _ string, _ ed25519.PublicKey, _ time.Time) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.rotates++
+	return nil
+}
+
+// TestHandleRegister_PutRace_SamePubkeyIdempotent: a parallel claim by
+// the same pubkey wins the race; we lose at Put with ErrAlreadyExists,
+// re-Get sees our own pubkey, and we treat it as an idempotent reconnect
+// (newRegistration=false, success).
+func TestHandleRegister_PutRace_SamePubkeyIdempotent(t *testing.T) {
+	h := newRegHarness(t)
+	pub, priv := newKey(t)
+	h.storeOverride = &raceStore{
+		winnerEntry: identity.Entry{Unique: "alpha", Pubkey: pub},
+	}
+	h.start()
+
+	h.sendRegister("alpha", priv, time.Now().Unix())
+	res := h.awaitResult()
+	if !res.ok {
+		t.Fatal("race-with-same-pubkey: handleRegister returned !ok (expected idempotent success)")
+	}
+	if res.res.unique != "alpha" {
+		t.Errorf("unique = %q, want alpha", res.res.unique)
+	}
+	if res.res.newRegistration {
+		t.Error("race-with-same-pubkey should produce newRegistration=false (we did not actually claim)")
+	}
+	if !bytes.Equal(res.res.pubkey, pub) {
+		t.Error("registerResult.pubkey not set to the connecting client's key")
+	}
+
+	rs := h.storeOverride.(*raceStore)
+	if rs.gets != 2 {
+		t.Errorf("Get calls = %d, want 2 (initial + re-Get after conflict)", rs.gets)
+	}
+	if rs.puts != 1 {
+		t.Errorf("Put calls = %d, want 1", rs.puts)
+	}
+	if rs.touches != 1 {
+		t.Errorf("Touch calls = %d, want 1 (idempotent fallback should refresh last_seen)", rs.touches)
+	}
+
+	// Cert was issued before Put — the issuance happened on our side
+	// regardless of who won the race. (Bug 2's singleflight makes this
+	// cheap when the parallel issuer was for the same baseName.)
+	if got := h.ensurer.Calls(); len(got) != 1 || got[0] != "alpha-tunnel" {
+		t.Errorf("ensurer.Calls = %v, want [alpha-tunnel]", got)
+	}
+
+	if logs := h.logBuf.String(); !bytes.Contains([]byte(logs), []byte("identity put race: reconciled as idempotent reconnect")) {
+		t.Errorf("expected reconciled log line; got: %s", logs)
+	}
+}
+
+// TestHandleRegister_PutRace_DifferentPubkeyKeyMismatch: a parallel
+// claim by a *different* pubkey wins the race; we lose at Put, re-Get
+// sees a foreign pubkey, and we deny key_mismatch (the loser must
+// re-attempt through the standard Challenge/Proof reclaim flow on a
+// future connection — racing two Registers is not a substitute).
+func TestHandleRegister_PutRace_DifferentPubkeyKeyMismatch(t *testing.T) {
+	h := newRegHarness(t)
+	winnerPub, _ := newKey(t)
+	_, loserPriv := newKey(t)
+	h.storeOverride = &raceStore{
+		winnerEntry: identity.Entry{Unique: "alpha", Pubkey: winnerPub},
+	}
+	h.start()
+
+	h.sendRegister("alpha", loserPriv, time.Now().Unix())
+	expectDeny(t, h, "key_mismatch")
+
+	rs := h.storeOverride.(*raceStore)
+	if rs.gets != 2 {
+		t.Errorf("Get calls = %d, want 2", rs.gets)
+	}
+	if rs.touches != 0 {
+		t.Errorf("Touch calls = %d, want 0 (different-pubkey path must not refresh another owner's last_seen)", rs.touches)
+	}
+	if logs := h.logBuf.String(); !bytes.Contains([]byte(logs), []byte("register denied: race lost to different pubkey")) {
+		t.Errorf("expected race-lost log line; got: %s", logs)
+	}
+}
+
+// TestHandleRegister_PutRace_GetAfterConflictFails: if the re-Get
+// itself fails (DB went unhealthy between Put and Get), we must
+// surface a generic store error rather than silently treating the
+// session as either authorized or anonymously denied.
+func TestHandleRegister_PutRace_GetAfterConflictFails(t *testing.T) {
+	h := newRegHarness(t)
+	_, priv := newKey(t)
+	h.storeOverride = &raceStore{
+		getErr: errors.New("disk on fire"),
+	}
+	h.start()
+
+	h.sendRegister("alpha", priv, time.Now().Unix())
+	expectDeny(t, h, "store error")
+
+	if logs := h.logBuf.String(); !bytes.Contains([]byte(logs), []byte("identity get-after-conflict failed")) {
+		t.Errorf("expected get-after-conflict log line; got: %s", logs)
 	}
 }
 
