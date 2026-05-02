@@ -183,6 +183,29 @@ func Connect(ctx context.Context, opts Options) (*Session, error) {
 	if err != nil {
 		return nil, fmt.Errorf("dial: %w", err)
 	}
+
+	// closeOnCancel: from here until Connect returns, ctx cancellation
+	// closes rawConn. That cascades to TLS Read/Write, the HTTP upgrade
+	// I/O, yamux, and the control-stream Register dance — none of which
+	// are ctx-aware on their own. Without this watcher, a SIGINT during
+	// (e.g.) the multi-minute Register wait while tunneld provisions a
+	// new LE wildcard would leave the goroutine parked in a syscall the
+	// runtime cannot preempt, and the process appears hung.
+	//
+	// On a successful return the watcher exits without closing —
+	// ownership of rawConn passes to the returned Session. On any error
+	// path Connect already calls tlsConn.Close itself; a late watcher
+	// fire is a no-op on an already-closed conn.
+	connectDone := make(chan struct{})
+	defer close(connectDone)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = rawConn.Close()
+		case <-connectDone:
+		}
+	}()
+
 	tlsConn := tls.Client(rawConn, tlsCfg)
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
 		_ = rawConn.Close()
@@ -233,6 +256,9 @@ func Connect(ctx context.Context, opts Options) (*Session, error) {
 		return nil, fmt.Errorf("open control stream: %w", err)
 	}
 
+	logger.Info("awaiting RegisterOK from server",
+		"unique", opts.Unique,
+		"hint", "first-time uniques can take 1-3 min while the server provisions a wildcard cert")
 	hostname, err := registerWithServer(stream, opts.Unique, opts.PrivateKey, logger)
 	if err != nil {
 		_ = yam.Close()
