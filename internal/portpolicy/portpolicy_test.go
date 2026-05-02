@@ -44,9 +44,9 @@ func TestParse(t *testing.T) {
 			wantPermit: []int{1977, 3000, 3099, 8080},
 			wantReject: []int{22, 1976, 3100, 8081},
 		},
-		"defaults-do-not-permit-dangerous-ports": {
+		"defaults-include-9898-and-not-dangerous-ports": {
 			spec:       DefaultSpec,
-			wantPermit: []int{1977, 3000, 4000, 8080},
+			wantPermit: []int{1977, 3000, 4000, 8080, 9898},
 			// SSH, Postgres, Redis, Docker daemon, MySQL, Mongo etc.
 			// must NOT be in the default policy.
 			wantReject: []int{22, 23, 25, 2375, 2376, 3306, 5432, 6379, 11211, 27017},

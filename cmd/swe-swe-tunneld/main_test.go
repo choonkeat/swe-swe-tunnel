@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/choonkeat/swe-swe-tunnel/internal/allowlist"
+	"github.com/choonkeat/swe-swe-tunnel/internal/portpolicy"
 )
 
 func writeKeyFile(t *testing.T, dir, name string, pub ed25519.PublicKey) {
@@ -118,4 +119,98 @@ func TestReloadAllowlistAndRevoke_ParseErrorPreservesAndSkipsRevoke(t *testing.T
 	if strings.Contains(logs, "session terminated: revoked") {
 		t.Errorf("RevokeMissing log appeared after a failed reload; got: %s", logs)
 	}
+}
+
+// TestReloadPortPolicy_FilePicksUpEdits drives the SIGHUP-handler
+// helper for the port allowlist: edit the file, fire reloadPortPolicy,
+// and assert (a) Permits flips on the new port and (b) the log line
+// reports the change.
+func TestReloadPortPolicy_FilePicksUpEdits(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ports")
+	if err := os.WriteFile(path, []byte("1977"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ports, err := portpolicy.LoadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ports.Permits(8080) {
+		t.Fatal("baseline: 8080 must not be permitted")
+	}
+
+	if err := os.WriteFile(path, []byte("1977,8080"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	reloadPortPolicy(ports, logger)
+
+	if !ports.Permits(8080) {
+		t.Error("reloadPortPolicy: 8080 should be permitted after file edit")
+	}
+	logs := buf.String()
+	if !strings.Contains(logs, "port allowlist reloaded") {
+		t.Errorf("expected 'port allowlist reloaded' log; got: %s", logs)
+	}
+	if !strings.Contains(logs, "changed=true") {
+		t.Errorf("expected 'changed=true' in log; got: %s", logs)
+	}
+}
+
+// TestReloadPortPolicy_ParseErrorPreservesAndLogs verifies the spec
+// invariant: a malformed file at SIGHUP keeps the prior policy live
+// and logs keeping_previous=true. An operator who fat-fingers the
+// file does not lose all their port routes mid-flight.
+func TestReloadPortPolicy_ParseErrorPreservesAndLogs(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ports")
+	if err := os.WriteFile(path, []byte("1977,8080"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ports, err := portpolicy.LoadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(path, []byte("garbage-not-a-port"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	reloadPortPolicy(ports, logger)
+
+	if !ports.Permits(1977) || !ports.Permits(8080) {
+		t.Error("prior policy should be preserved after parse error")
+	}
+	logs := buf.String()
+	if !strings.Contains(logs, "port allowlist reload failed") {
+		t.Errorf("expected 'port allowlist reload failed' log; got: %s", logs)
+	}
+	if !strings.Contains(logs, "keeping_previous=true") {
+		t.Errorf("expected 'keeping_previous=true' log; got: %s", logs)
+	}
+}
+
+// TestReloadPortPolicy_InlineSourceIsSilent confirms reloadPortPolicy
+// is a quiet no-op for the inline (flag/env/default) source — it
+// neither logs nor errors. This avoids a spam log every SIGHUP for
+// the common operator setup.
+func TestReloadPortPolicy_InlineSourceIsSilent(t *testing.T) {
+	ports, err := portpolicy.LoadInline("1977", "flag")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	reloadPortPolicy(ports, logger)
+	if buf.Len() != 0 {
+		t.Errorf("inline reload should be silent; got log: %s", buf.String())
+	}
+}
+
+// TestReloadPortPolicy_NilSafe: a nil *portpolicy.Set must not panic.
+func TestReloadPortPolicy_NilSafe(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+	reloadPortPolicy(nil, logger) // must not panic
 }

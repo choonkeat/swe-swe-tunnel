@@ -15,6 +15,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -24,6 +25,7 @@ import (
 	"github.com/choonkeat/swe-swe-tunnel/internal/allowlist"
 	"github.com/choonkeat/swe-swe-tunnel/internal/control"
 	"github.com/choonkeat/swe-swe-tunnel/internal/identity"
+	"github.com/choonkeat/swe-swe-tunnel/internal/portpolicy"
 	"github.com/choonkeat/swe-swe-tunnel/internal/ratelimit"
 )
 
@@ -684,8 +686,19 @@ func handleDeregister(
 // route returns the catch-all http.Handler. r.Host matching
 // `{port}.{label}.{apex}` with {label} ending in `-tunnel` is reverse-proxied
 // through the matching tunnel; everything else falls through to `fallback`.
-func route(reg *registry, apex string, fallback http.Handler) http.Handler {
+//
+// `ports` (if non-nil) gates the `{port}` label: anything outside the
+// allowlist (and anything that doesn't parse as an integer in the
+// 1-65535 range) gets `404 "port not allowed"` BEFORE the request is
+// forwarded to the client. The wire-visible deny string matches what
+// the client used to return when port gating lived there, so any
+// operator runbook keyed on it keeps working. A nil ports gate
+// short-circuits to "permit all" (used by tests that don't care).
+func route(reg *registry, apex string, ports *portpolicy.Set, logger *slog.Logger, fallback http.Handler) http.Handler {
 	apex = strings.ToLower(apex)
+	if logger == nil {
+		logger = slog.Default()
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		host := normalizeHost(r.Host)
 		rest, ok := strings.CutSuffix(host, "."+apex)
@@ -698,10 +711,20 @@ func route(reg *registry, apex string, fallback http.Handler) http.Handler {
 			fallback.ServeHTTP(w, r)
 			return
 		}
+		portLabel := rest[:dot]
 		sessionLabel := rest[dot+1:]
 		if !strings.HasSuffix(sessionLabel, "-tunnel") {
 			fallback.ServeHTTP(w, r)
 			return
+		}
+		if ports != nil {
+			n, err := strconv.Atoi(portLabel)
+			if err != nil || n < 1 || n > 65535 || !ports.Permits(n) {
+				logger.Warn("port not in allowlist; rejecting",
+					"port", portLabel, "host", r.Host, "remote", r.RemoteAddr)
+				http.Error(w, "port not allowed", http.StatusNotFound)
+				return
+			}
 		}
 		ts := reg.get(sessionLabel)
 		if ts == nil {

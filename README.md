@@ -49,6 +49,8 @@ go build -o bin/swe-swe-tunnel ./cmd/swe-swe-tunnel
 | `--register-rate-ip-per-hour` | — | `5` | no | Per-IP REGISTER limit. `0` disables. |
 | `--register-rate-pubkey-per-day` | — | `10` | no | Per-pubkey REGISTER limit. `0` disables. |
 | `--allowlist-dir` | `SWE_TUNNEL_ALLOWLIST_DIR` | (off) | no | Directory of authorized pubkey files; gates Register. See "Access control" below. |
+| `--allowed-ports` | `SWE_TUNNEL_ALLOWED_PORTS` | `1977,3000-3099,4000-4099,5000-5099,5173,8000-8099,8080,8081,9898` | no | Inline destination-port allowlist; `all` disables the gate. Restart-only. |
+| `--allowed-ports-file` | `SWE_TUNNEL_ALLOWED_PORTS_FILE` | (off) | no | File path holding the port allowlist (multi-line + `#` comments OK). SIGHUP-reloadable. Mutually exclusive with the inline form. |
 
 DNS-provider credentials are read from the lego provider's standard env vars (e.g. `DNSIMPLE_OAUTH_TOKEN` for `dnsimple`, `CF_API_TOKEN` for cloudflare, etc.).
 
@@ -60,7 +62,7 @@ DNS-provider credentials are read from the lego provider's standard env vars (e.
 | `--unique` | `SWE_TUNNEL_UNIQUE` | — | yes | Bare label; server appends `-tunnel` (see "Naming"). |
 | `--target` | — | `127.0.0.1` | no | Forward target host. Port comes from the leftmost Host label. |
 | `--identity-key` | `SWE_TUNNEL_KEY` | `~/.swe-swe-tunnel/identity.key` | no | Ed25519 private key. Auto-generated on first run. |
-| `--ports` | `SWE_TUNNEL_PORTS` | (built-in safe set) | no | Comma-separated allowlist of forwardable ports (ranges OK: `3000-3099`); `all` disables the gate. |
+| `--ports` | `SWE_TUNNEL_PORTS` | (built-in safe set) | no | (deprecated; the server owns the port allowlist as of `--allowed-ports` — kept until commit 3 of `tasks/2026-05-02-server-side-port-allowlist.md`) Comma-separated allowlist of forwardable ports (ranges OK: `3000-3099`); `all` disables the gate. |
 | `--report-format` | `SWE_TUNNEL_REPORT_FORMAT` | `none` | no | Structured event stream on stdout: `none` or `jsonl`. See `tasks/2026-04-29-supervisor-event-protocol.md`. |
 | `--insecure` | — | `false` | no | Skip TLS verification. Testing only. |
 
@@ -207,6 +209,63 @@ A peer who can't sign for the claimed pubkey gets `signature invalid` regardless
 - Web/admin UI — the directory is the API
 - fsnotify watcher to remove the manual SIGHUP step
 - Pending-approval queue (operator approves out-of-band)
+
+## Access control: port allowlist
+
+The destination port in `{port}.{label}-tunnel.{apex}` is gated by a server-side allowlist. The default policy is `1977,3000-3099,4000-4099,5000-5099,5173,8000-8099,8080,8081,9898` — common dev/web ports plus 9898 (swe-swe primary UI). Anything outside the policy gets `404 "port not allowed"` at the apex, **before** the request reaches the tunnel client.
+
+This was previously a client-side decision (and still is, until commit 3 of the migration completes). Owning it on the server means each tunnel operator picks one policy that applies to every tenant, and clients no longer need to know which ports are reachable.
+
+### Enabling / overriding
+
+Two mutually-exclusive flags:
+
+| Flag | When to use | Reload? |
+|---|---|---|
+| `--allowed-ports=<spec>` (env: `SWE_TUNNEL_ALLOWED_PORTS`) | One-line policy that doesn't change after boot | restart-only |
+| `--allowed-ports-file=<path>` (env: `SWE_TUNNEL_ALLOWED_PORTS_FILE`) | Policy lives in a file the operator edits | SIGHUP-reloadable |
+
+The file form accepts both single-line specs and multi-line files with `#` comments and blank lines:
+
+```
+# /etc/swe-swe-tunneld/allowed-ports
+1977       # swe-swe primary
+3000-3099  # dev range
+9898       # swe-swe UI in tunnel mode
+```
+
+`spec="all"` disables the gate (every port permitted). Don't ship that to production — the apex operator is the only thing standing between the public internet and every localhost port the tunnel client can reach.
+
+### Reloading
+
+```sh
+$EDITOR /path/to/allowed-ports
+docker kill -s HUP swe-swe-tunneld
+docker logs --tail 5 swe-swe-tunneld   # expect "port allowlist reloaded ... changed=true"
+```
+
+A reload that fails to parse keeps the prior in-memory policy in place (logged as `port allowlist reload failed ... keeping_previous=true`). A typo'd file mid-flight does not flip the gate to deny-all — the operator can fix the file and HUP again.
+
+The boot log records which source is in effect:
+
+```
+port allowlist spec=1977,3000-3099,...,9898 source=default
+port allowlist spec=...                     source=flag
+port allowlist spec=...                     source=env
+port allowlist spec=...                     source=file:/etc/swe-swe-tunneld/allowed-ports
+```
+
+### Why server-side?
+
+- The apex operator is the only party with authority over what ports the tunnel exposes; they're better placed than each client to keep the policy current.
+- One configuration point removes drift across tenants (no "client A's `--ports` says X, client B's says Y").
+- A request denied by the gate never enters the yamux session, so the tunnel client is unaware of policy decisions and doesn't need to be re-released to change them.
+
+### Out of scope
+
+- Per-pubkey port policies — one global set is enough for the current operator profile.
+- A "deny" list — the allowlist *is* the policy; subtraction is editing the allowlist.
+- `>=N` shorthand — operators can already write `1024-65535` to express "any unprivileged port".
 
 ## Deregister (graceful release)
 

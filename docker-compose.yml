@@ -38,6 +38,17 @@ services:
       #
       # An empty directory with the env set means deny-all.
       SWE_TUNNEL_ALLOWLIST_DIR: ${SWE_TUNNEL_ALLOWLIST_DIR:-}
+      # Optional override of the destination port allowlist.
+      # Default (unset) is portpolicy.DefaultSpec —
+      # 1977,3000-3099,4000-4099,5000-5099,5173,8000-8099,8080,8081,9898.
+      # Inline form (restart-only) — operator can set either:
+      #   SWE_TUNNEL_ALLOWED_PORTS=1977,3000-3099,9898
+      # File form (SIGHUP-reloadable) — mutually exclusive with
+      # the inline form. Bind-mount your spec file in and point at
+      # the in-container path:
+      #   SWE_TUNNEL_ALLOWED_PORTS_FILE=/etc/swe-swe-tunneld/allowed-ports
+      SWE_TUNNEL_ALLOWED_PORTS: ${SWE_TUNNEL_ALLOWED_PORTS:-}
+      SWE_TUNNEL_ALLOWED_PORTS_FILE: ${SWE_TUNNEL_ALLOWED_PORTS_FILE:-}
     command:
       - --listen=:443
 

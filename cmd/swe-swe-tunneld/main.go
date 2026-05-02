@@ -25,6 +25,7 @@ import (
 	"github.com/choonkeat/swe-swe-tunnel/internal/allowlist"
 	"github.com/choonkeat/swe-swe-tunnel/internal/cert"
 	"github.com/choonkeat/swe-swe-tunnel/internal/identity"
+	"github.com/choonkeat/swe-swe-tunnel/internal/portpolicy"
 	"github.com/choonkeat/swe-swe-tunnel/internal/ratelimit"
 )
 
@@ -55,6 +56,15 @@ func main() {
 		// are reloaded on SIGHUP and live sessions whose key was removed
 		// are dropped immediately.
 		allowlistDir = flag.String("allowlist-dir", "", "directory of Ed25519 pubkey files (one per line, '#' comments); enables Register gate")
+		// Port allowlist: gates which destination port labels in
+		// {port}.{label}.{apex} the server is willing to proxy. Default
+		// (portpolicy.DefaultSpec) covers common dev/web ports plus 9898
+		// (swe-swe primary UI). The two flags are mutually exclusive:
+		// inline (--allowed-ports / SWE_TUNNEL_ALLOWED_PORTS) is
+		// restart-only; file (--allowed-ports-file /
+		// SWE_TUNNEL_ALLOWED_PORTS_FILE) is SIGHUP-reloadable.
+		allowedPorts     = flag.String("allowed-ports", portpolicy.DefaultSpec, "destination port allowlist (comma-separated, ranges like 3000-3099); 'all' disables the gate (DANGEROUS)")
+		allowedPortsFile = flag.String("allowed-ports-file", "", "path to a file containing the port allowlist (SIGHUP-reloadable); mutually exclusive with --allowed-ports")
 	)
 	flag.Parse()
 
@@ -75,11 +85,36 @@ func main() {
 		*allowlistDir = os.Getenv("SWE_TUNNEL_ALLOWLIST_DIR")
 	}
 
+	// --allowed-ports has a non-empty default (DefaultSpec), so the
+	// presence-check uses flag.Visit (via flagSet) rather than empty-string.
+	// SWE_TUNNEL_ALLOWED_PORTS overrides the default if no flag was passed.
+	// Same for the file form.
+	if envP, ok := os.LookupEnv("SWE_TUNNEL_ALLOWED_PORTS"); ok && !flagSet("allowed-ports") {
+		*allowedPorts = envP
+	}
+	if *allowedPortsFile == "" {
+		*allowedPortsFile = os.Getenv("SWE_TUNNEL_ALLOWED_PORTS_FILE")
+	}
+
 	if *apex == "" || *email == "" {
 		flag.Usage()
 		logger.Error("--apex-domain and --acme-email are required (or SWE_TUNNEL_APEX / SWE_TUNNEL_ACME_EMAIL)")
 		os.Exit(2)
 	}
+
+	// Mutually exclusive: an operator who set both is asking which one
+	// "wins" — fail loudly rather than picking silently.
+	if *allowedPortsFile != "" && flagSet("allowed-ports") {
+		logger.Error("--allowed-ports and --allowed-ports-file are mutually exclusive")
+		os.Exit(2)
+	}
+
+	ports, err := loadPortPolicy(*allowedPorts, *allowedPortsFile)
+	if err != nil {
+		logger.Error("port allowlist load failed", "err", err)
+		os.Exit(1)
+	}
+	logger.Info("port allowlist", "spec", ports.Spec(), "source", ports.Source())
 
 	// Wrap the lego DNS provider with our authoritative-NS pre-check so
 	// Present blocks until every authoritative NS for the apex actually
@@ -191,29 +226,33 @@ func main() {
 
 	reg := newRegistry()
 
-	// SIGHUP reload: re-read the allowlist directory and drop any live
-	// sessions whose pubkey is no longer authorized. RevokeMissing runs
-	// only on a successful reload — a parse error means the in-memory set
-	// (and therefore policy) didn't change, so no revoke is warranted.
-	if allow != nil {
-		hupCh := make(chan os.Signal, 1)
-		signal.Notify(hupCh, syscall.SIGHUP)
-		go func() {
-			defer signal.Stop(hupCh)
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-hupCh:
+	// SIGHUP reload: re-read the allowlist directory (drop any live
+	// sessions whose pubkey is no longer authorized) AND re-read the
+	// port allowlist file (if file-sourced). Both are no-ops when
+	// their respective source isn't reloadable (allow is nil; ports
+	// is inline-sourced), but the signal handler is always armed so
+	// an operator who later switches to a file source doesn't have
+	// to restart to get HUP behaviour.
+	hupCh := make(chan os.Signal, 1)
+	signal.Notify(hupCh, syscall.SIGHUP)
+	go func() {
+		defer signal.Stop(hupCh)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-hupCh:
+				if allow != nil {
 					reloadAllowlistAndRevoke(allow, reg, logger)
 				}
+				reloadPortPolicy(ports, logger)
 			}
-		}()
-	}
+		}
+	}()
 
 	mux := http.NewServeMux()
 	mux.Handle("/v1/connect", connectHandler(reg, idStore, mgr, *apex, ipLim, keyLim, allow, logger))
-	mux.Handle("/", route(reg, *apex, helloHandler(*apex)))
+	mux.Handle("/", route(reg, *apex, ports, logger, helloHandler(*apex)))
 
 	srv := &http.Server{
 		Addr:              *listen,
@@ -299,6 +338,67 @@ func reloadAllowlistAndRevoke(allow *allowlist.Set, reg *registry, logger *slog.
 		"files", files, "count", allow.Len(),
 		"added", added, "removed", removed)
 	reg.RevokeMissing(allow, logger)
+}
+
+// loadPortPolicy resolves the port-allowlist source. Mutual exclusion
+// is checked by the caller; here we only pick the active one.
+//
+// Source labels emitted into boot logs:
+//
+//	source=default   no flag, no env, no file → compiled-in DefaultSpec
+//	source=flag      --allowed-ports=...
+//	source=env       SWE_TUNNEL_ALLOWED_PORTS
+//	source=file:/p   --allowed-ports-file=/p (SIGHUP-reloadable)
+func loadPortPolicy(inline, file string) (*portpolicy.Set, error) {
+	if file != "" {
+		return portpolicy.LoadFile(file)
+	}
+	src := "default"
+	if flagSet("allowed-ports") {
+		src = "flag"
+	} else if _, ok := os.LookupEnv("SWE_TUNNEL_ALLOWED_PORTS"); ok {
+		src = "env"
+	}
+	return portpolicy.LoadInline(inline, src)
+}
+
+// reloadPortPolicy is a SIGHUP hook for the port allowlist. For the
+// inline source it's a no-op (Set.Reload returns false, nil); for the
+// file source it re-reads + re-parses + atomic-swaps on success and
+// preserves the prior policy on parse error.
+func reloadPortPolicy(ports *portpolicy.Set, logger *slog.Logger) {
+	if ports == nil {
+		return
+	}
+	if ports.File() == "" {
+		// inline source: nothing to reload, don't bother logging.
+		return
+	}
+	changed, err := ports.Reload()
+	if err != nil {
+		logger.Error("port allowlist reload failed",
+			"source", ports.Source(), "err", err,
+			"keeping_previous", true)
+		return
+	}
+	logger.Info("port allowlist reloaded",
+		"source", ports.Source(),
+		"spec", ports.Spec(),
+		"changed", changed)
+}
+
+// flagSet reports whether the named flag was set on the command line.
+// Used to give CLI flags precedence over env-var defaults without
+// having to distinguish "user passed empty string" from "user didn't
+// pass it at all".
+func flagSet(name string) bool {
+	found := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			found = true
+		}
+	})
+	return found
 }
 
 func defaultStateDir() string {

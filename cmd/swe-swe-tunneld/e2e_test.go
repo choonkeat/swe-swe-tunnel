@@ -20,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -27,6 +28,7 @@ import (
 
 	"github.com/choonkeat/swe-swe-tunnel/internal/allowlist"
 	"github.com/choonkeat/swe-swe-tunnel/internal/identity"
+	"github.com/choonkeat/swe-swe-tunnel/internal/portpolicy"
 	"github.com/choonkeat/swe-swe-tunnel/internal/ratelimit"
 	"github.com/choonkeat/swe-swe-tunnel/internal/tunnelclient"
 )
@@ -50,7 +52,21 @@ type e2eSuite struct {
 
 func newE2ESuite(t *testing.T) *e2eSuite {
 	t.Helper()
-	return newE2ESuiteWith(t, nil, "")
+	return newE2ESuiteWith(t, nil, "", nil)
+}
+
+// newE2ESuiteWithPorts builds the same in-process tunneld as
+// newE2ESuite but installs a server-side port allowlist. The gate
+// runs in route() before the request reaches the client, so a
+// denied port produces 404 "port not allowed" without the backend
+// ever seeing it.
+func newE2ESuiteWithPorts(t *testing.T, spec string) *e2eSuite {
+	t.Helper()
+	ports, err := portpolicy.LoadInline(spec, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return newE2ESuiteWith(t, nil, "", ports)
 }
 
 // newE2ESuiteWithAllowlist builds the same in-process tunneld as
@@ -72,10 +88,10 @@ func newE2ESuiteWithAllowlist(t *testing.T, allowedPubs ...ed25519.PublicKey) *e
 	if err != nil {
 		t.Fatalf("allowlist.Load: %v", err)
 	}
-	return newE2ESuiteWith(t, set, dir)
+	return newE2ESuiteWith(t, set, dir, nil)
 }
 
-func newE2ESuiteWith(t *testing.T, allow *allowlist.Set, allowDir string) *e2eSuite {
+func newE2ESuiteWith(t *testing.T, allow *allowlist.Set, allowDir string, ports *portpolicy.Set) *e2eSuite {
 	t.Helper()
 	apex := "tunnel.test"
 	store, err := identity.Open(filepath.Join(t.TempDir(), "ids.db"))
@@ -95,7 +111,7 @@ func newE2ESuiteWith(t *testing.T, allow *allowlist.Set, allowDir string) *e2eSu
 	})
 	mux := http.NewServeMux()
 	mux.Handle("/v1/connect", connectHandler(reg, store, ensurer, apex, ipLim, keyLim, allow, logger))
-	mux.Handle("/", route(reg, apex, apexHello))
+	mux.Handle("/", route(reg, apex, ports, logger, apexHello))
 
 	tunneld := httptest.NewTLSServer(mux)
 	t.Cleanup(tunneld.Close)
@@ -489,7 +505,7 @@ func TestE2E_RateLimitedIP(t *testing.T) {
 
 	mux := http.NewServeMux()
 	mux.Handle("/v1/connect", connectHandler(reg, store, ensurer, apex, ipLim, keyLim, nil, logger))
-	mux.Handle("/", route(reg, apex, http.NotFoundHandler()))
+	mux.Handle("/", route(reg, apex, nil, nil, http.NotFoundHandler()))
 
 	tunneld := httptest.NewTLSServer(mux)
 	defer tunneld.Close()
@@ -890,4 +906,83 @@ func TestE2E_Allowlist_LiveRevoke(t *testing.T) {
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("client did not observe session close within 500ms after revoke")
 	}
+}
+
+// --------------------------------------------------------------------------
+// Server-side port allowlist (commit 2 of the port-allowlist task)
+// --------------------------------------------------------------------------
+
+// TestE2E_PortAllowlist_DenyShortCircuitsBeforeClient: the gate runs in
+// route() BEFORE the request enters the yamux session, so a denied
+// port produces "port not allowed" without the tunnel client (and
+// therefore the backend) ever seeing it. We assert that with an
+// instrumented backend that increments a counter on every hit.
+func TestE2E_PortAllowlist_DenyShortCircuitsBeforeClient(t *testing.T) {
+	s := newE2ESuiteWithPorts(t, "1977")
+
+	var backendHits atomic.Int32
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		backendHits.Add(1)
+		_, _ = w.Write([]byte("backend"))
+	}))
+	defer backend.Close()
+	backendURL, _ := url.Parse(backend.URL)
+
+	_, priv, _ := ed25519.GenerateKey(rand.Reader)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sess, err := s.dialAndRegister(ctx, "alpha", priv)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	doneServe := s.servePassthrough(ctx, sess, backendURL)
+	if !waitFor(t, 5*time.Second, func() bool { return s.registry.get("alpha-tunnel") != nil }) {
+		t.Fatal("registry never saw the new session")
+	}
+
+	httpClient := s.httpClient()
+
+	// Denied port (22) — must short-circuit at the server.
+	denied := "22.alpha-tunnel." + s.apex
+	req1, _ := http.NewRequest(http.MethodGet, "https://"+denied+"/", nil)
+	req1.Host = denied
+	resp1, err := httpClient.Do(req1)
+	if err != nil {
+		t.Fatalf("denied port request: %v", err)
+	}
+	defer resp1.Body.Close()
+	if resp1.StatusCode != http.StatusNotFound {
+		t.Errorf("denied port: status = %d, want 404", resp1.StatusCode)
+	}
+	body1, _ := io.ReadAll(resp1.Body)
+	if !strings.Contains(string(body1), "port not allowed") {
+		t.Errorf("denied port body = %q, want substring 'port not allowed'", body1)
+	}
+	if h := backendHits.Load(); h != 0 {
+		t.Errorf("backend was hit %d times for a denied port; gate should short-circuit", h)
+	}
+
+	// Allowed port (1977) — must pass through to the backend.
+	allowed := "1977.alpha-tunnel." + s.apex
+	req2, _ := http.NewRequest(http.MethodGet, "https://"+allowed+"/", nil)
+	req2.Host = allowed
+	resp2, err := httpClient.Do(req2)
+	if err != nil {
+		t.Fatalf("allowed port request: %v", err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != 200 {
+		t.Errorf("allowed port: status = %d, want 200", resp2.StatusCode)
+	}
+	body2, _ := io.ReadAll(resp2.Body)
+	if string(body2) != "backend" {
+		t.Errorf("allowed port body = %q, want 'backend'", body2)
+	}
+	if h := backendHits.Load(); h != 1 {
+		t.Errorf("backend hits = %d after one allowed request, want 1", h)
+	}
+
+	cancel()
+	<-doneServe
 }

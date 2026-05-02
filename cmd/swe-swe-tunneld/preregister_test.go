@@ -211,7 +211,7 @@ func TestPreRegisterTimeout_LongCertIssuanceDoesNotKillSession(t *testing.T) {
 
 	mux := http.NewServeMux()
 	mux.Handle("/v1/connect", connectHandler(reg, store, slowEnsurer, apex, ipLim, keyLim, nil, logger))
-	mux.Handle("/", route(reg, apex, http.NotFoundHandler()))
+	mux.Handle("/", route(reg, apex, nil, nil, http.NotFoundHandler()))
 
 	tunneld := httptest.NewTLSServer(mux)
 	t.Cleanup(tunneld.Close)
@@ -293,7 +293,7 @@ func buildPreRegisterTestServer(t *testing.T) (*httptest.Server, *tls.Config) {
 
 	mux := http.NewServeMux()
 	mux.Handle("/v1/connect", connectHandler(reg, store, &fakeEnsurer{}, apex, ipLim, keyLim, nil, logger))
-	mux.Handle("/", route(reg, apex, http.NotFoundHandler()))
+	mux.Handle("/", route(reg, apex, nil, nil, http.NotFoundHandler()))
 
 	tunneld := httptest.NewTLSServer(mux)
 	t.Cleanup(tunneld.Close)
