@@ -16,6 +16,18 @@ import (
 	"github.com/choonkeat/swe-swe-tunnel/internal/portpolicy"
 )
 
+// TestMain disables the LE-issuance grace window by default for the whole
+// package. The grace exists in production to give a human-typo'd unique
+// time to be Ctrl-C'd before consuming an LE issuance slot, but it would
+// add 5s of dead time to every Connect-based test that exercises a fresh
+// unique. Tests that specifically exercise the grace-bail path opt back
+// in by setting issuanceGrace to a non-zero duration (with a Cleanup to
+// restore).
+func TestMain(m *testing.M) {
+	issuanceGrace = 0
+	os.Exit(m.Run())
+}
+
 func writeKeyFile(t *testing.T, dir, name string, pub ed25519.PublicKey) {
 	t.Helper()
 	b64 := base64.RawStdEncoding.EncodeToString(pub)

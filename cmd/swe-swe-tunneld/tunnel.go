@@ -63,6 +63,18 @@ const maxClockSkew = 5 * time.Minute
 // slow to assert against in unit-test land).
 var preRegisterTimeout = 10 * time.Second
 
+// issuanceGrace is a short window between accepting a Register for a
+// fresh unique and starting Let's Encrypt issuance. If the client
+// disconnects during the grace (typo'd unique → Ctrl-C → new attempt
+// with the right name), we abort before consuming an LE issuance slot
+// and refund the rate-limit budget. The window is intentionally short:
+// long enough for a human reading the client's "awaiting RegisterOK"
+// log to spot a typo and Ctrl-C, short enough that a happy-path
+// first-time deploy isn't slowed down noticeably.
+//
+// var rather than const so tests can shorten it.
+var issuanceGrace = 5 * time.Second
+
 // tunnelSession bundles a yamux session with its dedicated reverse proxy.
 // Building the proxy once per session lets us reuse a single Transport.
 type tunnelSession struct {
@@ -269,7 +281,25 @@ func connectHandler(
 			return
 		}
 
-		ctx := r.Context()
+		// Bridge yamux session close into the request ctx. Hijacked
+		// connections do not propagate TCP-close into r.Context() — the
+		// http server detaches its tracking after Hijack — so without
+		// this bridge handleRegister cannot tell that the client just
+		// hung up. yamux *does* notice (its read loop on the underlying
+		// conn fails and it closes CloseChan), so we use that as the
+		// authoritative "client gone" signal and tie it to ctx
+		// cancellation. The grace window before EnsureName depends on
+		// this: a Ctrl-C-during-grace must abort issuance.
+		ctx, cancelOnSessClose := context.WithCancel(r.Context())
+		defer cancelOnSessClose()
+		go func() {
+			select {
+			case <-sess.CloseChan():
+				cancelOnSessClose()
+			case <-ctx.Done():
+			}
+		}()
+
 		regResult, ok := handleRegister(ctx, stream, store, certMgr, ipLimiter, pubkeyLimiter, allow, logger, conn.RemoteAddr().String())
 		if !ok {
 			return
@@ -441,6 +471,33 @@ func handleRegister(
 				"remote", remoteAddr, "unique", reg.Unique, "retry_after_sec", retry)
 			sendRateLimitDeny(stream, "rate_limited:pubkey", retry)
 			return registerResult{}, false
+		}
+		// Grace window before LE issuance. Gives the client a moment to
+		// notice a typo'd unique and Ctrl-C, so we don't burn an LE slot
+		// (and refund the rate-limit budget we just consumed) before
+		// touching the ACME path. ctx fires here when either the request
+		// context cancels OR the yamux session closes — see the bridge
+		// in connectHandler. Tests set issuanceGrace=0 to skip entirely.
+		if issuanceGrace > 0 {
+			graceTimer := time.NewTimer(issuanceGrace)
+			select {
+			case <-graceTimer.C:
+				// proceed to EnsureName
+			case <-ctx.Done():
+				graceTimer.Stop()
+				if ipLimiter != nil {
+					ipLimiter.CancelLatest(ipKey)
+				}
+				if pubkeyLimiter != nil {
+					pubkeyLimiter.CancelLatest(string(pub))
+				}
+				logger.Info("register aborted by client during issuance grace",
+					"unique", reg.Unique,
+					"remote", remoteAddr,
+					"pubkey_fp", fingerprint(pub),
+					"reason", ctx.Err())
+				return registerResult{}, false
+			}
 		}
 		// Issue cert FIRST (may fail; if so, the store stays clean).
 		if err := certMgr.EnsureName(ctx, label); err != nil {
