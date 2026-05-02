@@ -1,4 +1,10 @@
-package tunnelclient
+// Package portpolicy parses and evaluates per-port allowlist policies of
+// the form "1977,3000-3099,8080" (single ports + inclusive ranges).
+//
+// The same parser is used by the tunneld server (gating which destination
+// ports it will proxy across all tenants) and historically by the tunnel
+// client; the package lives outside both so neither imports the other.
+package portpolicy
 
 import (
 	"fmt"
@@ -6,15 +12,9 @@ import (
 	"strings"
 )
 
-// PortPolicy decides which destination ports PortDispatchHandler is
-// allowed to forward to. Without a policy the client would gladly proxy
-// the public Internet to every TCP port on the target host (SSH, Redis,
-// Docker daemon, etc.) — see docs/design.md non-goal "Arbitrary 1–65535
-// ports on the public side".
-//
-// A zero PortPolicy permits nothing. Use AllowAllPorts() to disable the
-// gate, or ParsePortPolicy to build one from a comma/range spec like
-// "1977,3000-3099,8080".
+// PortPolicy decides which destination ports may be forwarded. Without a
+// policy nothing is permitted (zero value = deny-all). Use AllowAll() to
+// disable the gate, or Parse() to build one from a comma/range spec.
 type PortPolicy struct {
 	all    bool
 	single map[int]struct{}
@@ -23,34 +23,33 @@ type PortPolicy struct {
 
 type portRange struct{ lo, hi int }
 
-// AllowAllPorts returns a PortPolicy that permits every port. Convenient
-// for tests and for operators who explicitly opt out of the allowlist
-// (`--ports=all`). Production use is strongly discouraged.
-func AllowAllPorts() *PortPolicy {
+// AllowAll returns a PortPolicy that permits every port. Convenient for
+// tests and for operators who explicitly opt out (`spec="all"`).
+// Production use is strongly discouraged.
+func AllowAll() *PortPolicy {
 	return &PortPolicy{all: true}
 }
 
-// DefaultPortSpec is the conservative default — covers the ports
-// docs/design.md mentions (1977, 3000, 4000, …) plus the common dev/web
-// ranges. Operators with services outside this set must override
-// `--ports` explicitly.
-const DefaultPortSpec = "1977,3000-3099,4000-4099,5000-5099,5173,8000-8099,8080,8081"
+// DefaultSpec is the conservative-but-useful baseline: covers the
+// common dev/web ports. Operators with services outside this set
+// must override.
+const DefaultSpec = "1977,3000-3099,4000-4099,5000-5099,5173,8000-8099,8080,8081"
 
-// ParsePortPolicy builds a PortPolicy from a comma-separated spec.
-// Each element is either a single port (`8080`) or an inclusive range
-// (`3000-3099`). The literal string "all" returns AllowAllPorts(); an
-// empty spec returns the zero policy (deny-all).
+// Parse builds a PortPolicy from a comma-separated spec. Each element is
+// a single port (`8080`) or an inclusive range (`3000-3099`). The
+// literal string "all" returns AllowAll(); an empty spec returns the
+// zero policy (deny-all).
 //
 // Returns an error on malformed input rather than silently dropping
-// entries — a typo in `--ports` should fail loudly, not be a permissive
-// surprise.
-func ParsePortPolicy(spec string) (*PortPolicy, error) {
+// entries — a typo in the policy spec should fail loudly, not be a
+// permissive surprise.
+func Parse(spec string) (*PortPolicy, error) {
 	spec = strings.TrimSpace(spec)
 	if spec == "" {
 		return &PortPolicy{}, nil
 	}
 	if strings.EqualFold(spec, "all") {
-		return AllowAllPorts(), nil
+		return AllowAll(), nil
 	}
 	p := &PortPolicy{single: make(map[int]struct{})}
 	for _, raw := range strings.Split(spec, ",") {
@@ -94,7 +93,8 @@ func parsePort(s string) (int, error) {
 	return n, nil
 }
 
-// Permits reports whether port may be forwarded.
+// Permits reports whether port may be forwarded. A nil PortPolicy
+// rejects everything (fail-closed).
 func (p *PortPolicy) Permits(port int) bool {
 	if p == nil {
 		return false

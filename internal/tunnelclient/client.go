@@ -29,6 +29,7 @@ import (
 	"github.com/hashicorp/yamux"
 
 	"github.com/choonkeat/swe-swe-tunnel/internal/control"
+	"github.com/choonkeat/swe-swe-tunnel/internal/portpolicy"
 )
 
 // DenyError wraps a server-sent Deny.Reason. Connect and Deregister
@@ -354,8 +355,8 @@ func Serve(ctx context.Context, sess *Session, handler http.Handler) error {
 // policy gates which ports are forwarded — anything outside the
 // allowlist returns 404 before the upstream dial, preventing the
 // public Internet from reaching every localhost port. Pass
-// AllowAllPorts() to disable the gate (tests, opt-in operators).
-func PortDispatchHandler(target string, policy *PortPolicy, logger *slog.Logger) http.Handler {
+// portpolicy.AllowAll() to disable the gate (tests, opt-in operators).
+func PortDispatchHandler(target string, policy *portpolicy.PortPolicy, logger *slog.Logger) http.Handler {
 	if logger == nil {
 		logger = slog.Default()
 	}

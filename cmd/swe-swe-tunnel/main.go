@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"syscall"
 
+	"github.com/choonkeat/swe-swe-tunnel/internal/portpolicy"
 	"github.com/choonkeat/swe-swe-tunnel/internal/tunnelclient"
 )
 
@@ -26,7 +27,7 @@ func main() {
 		identityKey  = flag.String("identity-key", "", "path to Ed25519 identity key (default ~/.swe-swe-tunnel/identity.key)")
 		insecure     = flag.Bool("insecure", false, "skip TLS verification (testing only)")
 		reportFormat = flag.String("report-format", "none", "supervisor event format on stdout: none|jsonl (env: SWE_TUNNEL_REPORT_FORMAT)")
-		ports        = flag.String("ports", tunnelclient.DefaultPortSpec, "allowlist of forwardable ports (comma-separated, ranges like 3000-3099); 'all' disables the gate (DANGEROUS — exposes every localhost port to the Internet)")
+		ports        = flag.String("ports", portpolicy.DefaultSpec, "allowlist of forwardable ports (comma-separated, ranges like 3000-3099); 'all' disables the gate (DANGEROUS — exposes every localhost port to the Internet)")
 	)
 	flag.Parse()
 
@@ -57,7 +58,7 @@ func main() {
 		os.Exit(2)
 	}
 
-	policy, err := tunnelclient.ParsePortPolicy(*ports)
+	policy, err := portpolicy.Parse(*ports)
 	if err != nil {
 		logger.Error("invalid --ports", "value", *ports, "err", err)
 		os.Exit(2)
