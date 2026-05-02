@@ -270,6 +270,7 @@ func connectHandler(
 			"label", regResult.label,
 			"remote", conn.RemoteAddr().String(),
 			"new_registration", regResult.newRegistration,
+			"pubkey_fp", fingerprint(regResult.pubkey),
 		)
 
 		// Run the post-RegisterOK control loop. Returns when the client hangs
@@ -309,7 +310,7 @@ func handleRegister(
 	certMgr certEnsurer,
 	ipLimiter *ratelimit.SlidingWindow,
 	pubkeyLimiter *ratelimit.SlidingWindow,
-	_ *allowlist.Set,
+	allow *allowlist.Set,
 	logger *slog.Logger,
 	remoteAddr string,
 ) (registerResult, bool) {
@@ -370,6 +371,21 @@ func handleRegister(
 
 	if !ed25519.Verify(pub, control.RegisterSigningPayload(pub, reg.Unique, reg.Timestamp), sig) {
 		sendDeny(stream, "signature invalid")
+		return registerResult{}, false
+	}
+
+	// Allowlist gate runs *after* signature verification by design.
+	// A peer who can't sign for the claimed pubkey gets "signature invalid"
+	// regardless of allowlist membership — they learn nothing about the
+	// list. A peer who *can* sign but isn't allowlisted gets
+	// "not_authorized": this is intentional disclosure to legitimate key
+	// holders so an operator can tell a friend "send me your boot
+	// fingerprint, I'll add it."
+	if allow != nil && !allow.Contains(pub) {
+		logger.Warn("register denied: not_authorized",
+			"remote", remoteAddr, "unique", reg.Unique,
+			"pubkey_fp", fingerprint(pub))
+		sendDeny(stream, "not_authorized")
 		return registerResult{}, false
 	}
 

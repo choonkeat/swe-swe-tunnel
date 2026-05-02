@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -16,6 +17,7 @@ import (
 	"net/http/httptest"
 	"net/http/httputil"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -23,6 +25,7 @@ import (
 
 	"golang.org/x/net/websocket"
 
+	"github.com/choonkeat/swe-swe-tunnel/internal/allowlist"
 	"github.com/choonkeat/swe-swe-tunnel/internal/identity"
 	"github.com/choonkeat/swe-swe-tunnel/internal/ratelimit"
 	"github.com/choonkeat/swe-swe-tunnel/internal/tunnelclient"
@@ -39,9 +42,40 @@ type e2eSuite struct {
 	ensurer  *fakeEnsurer
 	logger   *slog.Logger
 	tlsCfg   *tls.Config
+	// allowDir is set only when the suite was built with newE2ESuiteWithAllowlist.
+	// Tests use it to add/remove key files between Reload calls.
+	allow    *allowlist.Set
+	allowDir string
 }
 
 func newE2ESuite(t *testing.T) *e2eSuite {
+	t.Helper()
+	return newE2ESuiteWith(t, nil, "")
+}
+
+// newE2ESuiteWithAllowlist builds the same in-process tunneld as
+// newE2ESuite but with the gate enabled. The returned suite carries the
+// directory path so tests can drop/remove key files and trigger
+// reloadAllowlistAndRevoke directly (signal delivery is a separate
+// concern unit-tested elsewhere).
+func newE2ESuiteWithAllowlist(t *testing.T, allowedPubs ...ed25519.PublicKey) *e2eSuite {
+	t.Helper()
+	dir := t.TempDir()
+	for i, pub := range allowedPubs {
+		b64 := base64.RawStdEncoding.EncodeToString(pub)
+		name := filepath.Join(dir, fmt.Sprintf("k%d.pub", i))
+		if err := os.WriteFile(name, []byte(b64+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	set, err := allowlist.Load(dir)
+	if err != nil {
+		t.Fatalf("allowlist.Load: %v", err)
+	}
+	return newE2ESuiteWith(t, set, dir)
+}
+
+func newE2ESuiteWith(t *testing.T, allow *allowlist.Set, allowDir string) *e2eSuite {
 	t.Helper()
 	apex := "tunnel.test"
 	store, err := identity.Open(filepath.Join(t.TempDir(), "ids.db"))
@@ -60,7 +94,7 @@ func newE2ESuite(t *testing.T) *e2eSuite {
 		_, _ = w.Write([]byte("apex hello"))
 	})
 	mux := http.NewServeMux()
-	mux.Handle("/v1/connect", connectHandler(reg, store, ensurer, apex, ipLim, keyLim, nil, logger))
+	mux.Handle("/v1/connect", connectHandler(reg, store, ensurer, apex, ipLim, keyLim, allow, logger))
 	mux.Handle("/", route(reg, apex, apexHello))
 
 	tunneld := httptest.NewTLSServer(mux)
@@ -83,7 +117,43 @@ func newE2ESuite(t *testing.T) *e2eSuite {
 		ensurer:  ensurer,
 		logger:   logger,
 		tlsCfg:   tlsCfg,
+		allow:    allow,
+		allowDir: allowDir,
 	}
+}
+
+// addAllowedKey drops a key file for pub into the suite's allowlist
+// directory under the given filename. Caller is responsible for
+// triggering a reload.
+func (s *e2eSuite) addAllowedKey(name string, pub ed25519.PublicKey) {
+	s.t.Helper()
+	if s.allowDir == "" {
+		s.t.Fatal("addAllowedKey on a suite without allowlist")
+	}
+	b64 := base64.RawStdEncoding.EncodeToString(pub)
+	if err := os.WriteFile(filepath.Join(s.allowDir, name), []byte(b64+"\n"), 0o644); err != nil {
+		s.t.Fatal(err)
+	}
+}
+
+// removeAllowedKey deletes the named file from the allowlist directory.
+func (s *e2eSuite) removeAllowedKey(name string) {
+	s.t.Helper()
+	if err := os.Remove(filepath.Join(s.allowDir, name)); err != nil {
+		s.t.Fatal(err)
+	}
+}
+
+// reloadAllowlist re-reads the allowlist directory and drops any live
+// sessions whose pubkey is no longer authorized. Equivalent in effect
+// to a SIGHUP delivered to the daemon, but called directly to keep the
+// test off the OS signal-delivery path.
+func (s *e2eSuite) reloadAllowlist() {
+	s.t.Helper()
+	if s.allow == nil {
+		s.t.Fatal("reloadAllowlist on a suite without allowlist")
+	}
+	reloadAllowlistAndRevoke(s.allow, s.registry, s.logger)
 }
 
 // dialAndRegister runs the real tunnelclient.Connect against the suite's
@@ -690,3 +760,134 @@ func errorContains(err error, substr string) bool {
 }
 
 var _ = errorContains // keep available for future tests
+
+// --------------------------------------------------------------------------
+// Allowlist gate (e2e variants)
+// --------------------------------------------------------------------------
+
+// TestE2E_Allowlist_Denied: client whose key isn't in the allowlist
+// gets a permanent DenyError("not_authorized") from Connect, no session
+// is registered, and the apex route still serves the fallback page (the
+// gate does not affect non-tunnel traffic).
+func TestE2E_Allowlist_Denied(t *testing.T) {
+	allowedPub, _, _ := ed25519.GenerateKey(rand.Reader)
+	s := newE2ESuiteWithAllowlist(t, allowedPub)
+
+	_, priv, _ := ed25519.GenerateKey(rand.Reader)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	_, err := s.dialAndRegister(ctx, "alpha", priv)
+	if err == nil {
+		t.Fatal("Connect with unallowed key: expected error, got nil")
+	}
+	var de *tunnelclient.DenyError
+	if !errors.As(err, &de) {
+		t.Fatalf("Connect error = %v, want *DenyError", err)
+	}
+	if de.Reason != "not_authorized" {
+		t.Errorf("Deny.Reason = %q, want %q", de.Reason, "not_authorized")
+	}
+	// Apex hello must still serve — gate only affects /v1/connect.
+	resp, err := s.httpClient().Get(s.tunneld.URL + "/")
+	if err != nil {
+		t.Fatalf("apex GET: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if !strings.Contains(string(body), "apex hello") {
+		t.Errorf("apex body = %q, want 'apex hello'", string(body))
+	}
+}
+
+// TestE2E_Allowlist_Allowed: same setup but the client's key is in the
+// allowlist — Connect succeeds and traffic flows through the tunnel.
+func TestE2E_Allowlist_Allowed(t *testing.T) {
+	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
+	s := newE2ESuiteWithAllowlist(t, pub)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	sess, err := s.dialAndRegister(ctx, "alpha", priv)
+	if err != nil {
+		t.Fatalf("Connect with allowed key: %v", err)
+	}
+	defer sess.Close()
+	if want := "alpha-tunnel." + s.apex; sess.Hostname() != want {
+		t.Errorf("hostname = %q, want %q", sess.Hostname(), want)
+	}
+}
+
+// TestE2E_Allowlist_AddAndAllow: client is initially denied; operator
+// drops a key file into the directory and triggers a reload; client's
+// next Connect succeeds. Models the chat-driven onboarding flow.
+func TestE2E_Allowlist_AddAndAllow(t *testing.T) {
+	s := newE2ESuiteWithAllowlist(t /* empty — deny everyone */)
+
+	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if _, err := s.dialAndRegister(ctx, "alpha", priv); err == nil {
+		t.Fatal("first Connect: expected denial, got nil")
+	}
+
+	// Operator adds the key on disk, then signals reload.
+	s.addAllowedKey("alice.pub", pub)
+	s.reloadAllowlist()
+
+	// Retry — should succeed now.
+	sess, err := s.dialAndRegister(ctx, "alpha", priv)
+	if err != nil {
+		t.Fatalf("Connect after add+reload: %v", err)
+	}
+	defer sess.Close()
+}
+
+// TestE2E_Allowlist_LiveRevoke is the test that proves the chat-driven
+// revoke story works end-to-end:
+//
+//  1. Key K is in the allowlist; client registers and the session is live.
+//  2. Operator removes K from disk and triggers reload.
+//  3. RevokeMissing closes the live session within a small bound.
+//  4. The client observes session closure (CloseChan fires).
+//
+// We don't drive a follow-up Connect attempt here — that would just
+// re-exercise TestE2E_Allowlist_Denied. The novel assertion is "live
+// session dropped" within a deterministic bound.
+func TestE2E_Allowlist_LiveRevoke(t *testing.T) {
+	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
+	s := newE2ESuiteWithAllowlist(t, pub)
+	s.addAllowedKey("alice.pub", pub) // give the file a stable filename for removal
+	// We added a duplicate key under a fresh name; reload picks it up so
+	// removing both files later means deny-all.
+	s.reloadAllowlist()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	sess, err := s.dialAndRegister(ctx, "alpha", priv)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer sess.Close()
+
+	// Confirm the session is live by checking the registry.
+	if !waitFor(t, time.Second, func() bool { return s.registry.get("alpha-tunnel") != nil }) {
+		t.Fatal("session not visible in registry after Connect")
+	}
+
+	// Operator revokes alice.pub AND the suite's bootstrap k0.pub —
+	// after both are gone the directory is empty (deny-all).
+	s.removeAllowedKey("alice.pub")
+	s.removeAllowedKey("k0.pub")
+	s.reloadAllowlist()
+
+	// Server-side: registry should be cleaned within ~100ms (RevokeMissing
+	// closes outside the lock; the connectHandler defer prunes on
+	// CloseChan).
+	select {
+	case <-sess.CloseChan():
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("client did not observe session close within 500ms after revoke")
+	}
+}

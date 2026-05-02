@@ -7,14 +7,15 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"errors"
-	"io"
 	"log/slog"
 	"net"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/choonkeat/swe-swe-tunnel/internal/allowlist"
 	"github.com/choonkeat/swe-swe-tunnel/internal/control"
 	"github.com/choonkeat/swe-swe-tunnel/internal/identity"
 	"github.com/choonkeat/swe-swe-tunnel/internal/ratelimit"
@@ -55,7 +56,9 @@ type regHarness struct {
 	ensurer  *fakeEnsurer
 	ipLim    *ratelimit.SlidingWindow
 	keyLim   *ratelimit.SlidingWindow
+	allow    *allowlist.Set // nil = gate disabled (current behavior)
 	resultCh chan handleResult
+	logBuf   *bytes.Buffer
 }
 
 type handleResult struct {
@@ -91,12 +94,34 @@ func newRegHarness(t *testing.T) *regHarness {
 }
 
 func (h *regHarness) start() {
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	if h.logBuf == nil {
+		h.logBuf = &bytes.Buffer{}
+	}
+	logger := slog.New(slog.NewTextHandler(h.logBuf, nil))
 	go func() {
 		res, ok := handleRegister(context.Background(), h.server,
-			h.store, h.ensurer, h.ipLim, h.keyLim, nil, logger, "127.0.0.1:54321")
+			h.store, h.ensurer, h.ipLim, h.keyLim, h.allow, logger, "127.0.0.1:54321")
 		h.resultCh <- handleResult{res: res, ok: ok}
 	}()
+}
+
+// allowlistFor builds a fresh allowlist directory with one file per
+// pubkey and returns a loaded Set rooted there.
+func allowlistFor(t *testing.T, pubs ...ed25519.PublicKey) *allowlist.Set {
+	t.Helper()
+	dir := t.TempDir()
+	for i, pub := range pubs {
+		b64 := base64.RawStdEncoding.EncodeToString(pub)
+		name := filepath.Join(dir, "k"+string(rune('a'+i))+".pub")
+		if err := os.WriteFile(name, []byte(b64+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	set, err := allowlist.Load(dir)
+	if err != nil {
+		t.Fatalf("allowlist.Load: %v", err)
+	}
+	return set
 }
 
 func (h *regHarness) awaitResult() handleResult {
@@ -554,6 +579,131 @@ func TestHandleRegister_CertEnsurerFails_RefundIsKeyScoped(t *testing.T) {
 	if d := h.ipLim.RetryAfter("10.0.0.99"); d == 0 {
 		t.Error("unrelated IP budget freed by cert-failure refund — refund leaked across keys")
 	}
+}
+
+// --------------------------------------------------------------------------
+// Allowlist gate
+// --------------------------------------------------------------------------
+
+// TestHandleRegister_Allowlist_GateOff makes the gate-off invariant
+// explicit: when allow is nil, the existing open-registration code path
+// runs unchanged. Every other test in this file already exercises this
+// implicitly; an explicit case prevents an accidental regression that
+// would only show up when somebody flipped the default later.
+func TestHandleRegister_Allowlist_GateOff(t *testing.T) {
+	h := newRegHarness(t)
+	h.allow = nil
+	h.start()
+
+	_, priv := newKey(t)
+	h.sendRegister("alpha", priv, time.Now().Unix())
+
+	res := h.awaitResult()
+	if !res.ok {
+		t.Fatal("gate-off: handleRegister returned !ok")
+	}
+	if res.res.unique != "alpha" {
+		t.Errorf("unique = %q, want alpha", res.res.unique)
+	}
+}
+
+// TestHandleRegister_Allowlist_GateOnAllowed: the connecting client's
+// pubkey is in the allowlist → registration succeeds, store is written,
+// cert ensurer is called.
+func TestHandleRegister_Allowlist_GateOnAllowed(t *testing.T) {
+	h := newRegHarness(t)
+	pub, priv := newKey(t)
+	h.allow = allowlistFor(t, pub)
+	h.start()
+
+	h.sendRegister("alpha", priv, time.Now().Unix())
+
+	res := h.awaitResult()
+	if !res.ok {
+		t.Fatal("gate-on, key allowed: handleRegister returned !ok")
+	}
+	if res.res.unique != "alpha" {
+		t.Errorf("unique = %q, want alpha", res.res.unique)
+	}
+	if got := h.ensurer.Calls(); len(got) != 1 {
+		t.Errorf("ensurer.Calls = %v, want exactly one (cert issued)", got)
+	}
+	if _, err := h.store.Get(context.Background(), "alpha"); err != nil {
+		t.Errorf("store.Get(alpha) after allowed register: %v", err)
+	}
+}
+
+// TestHandleRegister_Allowlist_GateOnDenied: the connecting client's
+// pubkey is NOT in the allowlist → "not_authorized" deny, no store
+// write, no cert call. Plus the deny log line carries pubkey_fp so the
+// operator can correlate against a friend's reported boot fingerprint.
+func TestHandleRegister_Allowlist_GateOnDenied(t *testing.T) {
+	h := newRegHarness(t)
+	allowedPub, _ := newKey(t)            // someone else's key
+	h.allow = allowlistFor(t, allowedPub) // but NOT the connecting client's
+	h.start()
+
+	_, priv := newKey(t)
+	h.sendRegister("alpha", priv, time.Now().Unix())
+
+	expectDeny(t, h, "not_authorized")
+
+	if got := h.ensurer.Calls(); len(got) != 0 {
+		t.Errorf("ensurer.Calls = %v, want empty (no cert issued for denied register)", got)
+	}
+	if _, err := h.store.Get(context.Background(), "alpha"); !errors.Is(err, identity.ErrNotFound) {
+		t.Errorf("store.Get(alpha) after denied register: err=%v, want ErrNotFound", err)
+	}
+	if logs := h.logBuf.String(); !bytes.Contains([]byte(logs), []byte("register denied: not_authorized")) {
+		t.Errorf("expected 'register denied: not_authorized' in log; got: %s", logs)
+	}
+	if logs := h.logBuf.String(); !bytes.Contains([]byte(logs), []byte("pubkey_fp=")) {
+		t.Errorf("expected pubkey_fp= attribute in deny log; got: %s", logs)
+	}
+}
+
+// TestHandleRegister_Allowlist_BadSigKeyInList: a peer who can't sign
+// for the claimed key gets "signature invalid" — gate-after-sig must
+// not leak list membership to non-signers, even when the key they're
+// claiming is on the list.
+func TestHandleRegister_Allowlist_BadSigKeyInList(t *testing.T) {
+	h := newRegHarness(t)
+	allowedPub, _ := newKey(t) // signer doesn't have the matching priv
+	h.allow = allowlistFor(t, allowedPub)
+	h.start()
+
+	// Forge a Register frame that *claims* the allowed pubkey but signs
+	// with an unrelated key.
+	_, attackerPriv := newKey(t)
+	ts := time.Now().Unix()
+	badSig := ed25519.Sign(attackerPriv, control.RegisterSigningPayload(allowedPub, "alpha", ts))
+	if err := control.WriteMessage(h.client, control.KindRegister, control.Register{
+		Version:   control.ProtoVersion,
+		Unique:    "alpha",
+		Pubkey:    base64.RawStdEncoding.EncodeToString(allowedPub),
+		Timestamp: ts,
+		Sig:       base64.RawStdEncoding.EncodeToString(badSig),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	expectDeny(t, h, "signature invalid")
+}
+
+// TestHandleRegister_Allowlist_GoodSigKeyNotInList: a peer who *can*
+// sign for their key but isn't on the list gets "not_authorized" —
+// intentional disclosure (so an operator can tell a friend "your boot
+// fingerprint isn't on the list yet").
+func TestHandleRegister_Allowlist_GoodSigKeyNotInList(t *testing.T) {
+	h := newRegHarness(t)
+	otherPub, _ := newKey(t)
+	h.allow = allowlistFor(t, otherPub) // someone else's key on the list
+	h.start()
+
+	_, priv := newKey(t) // legitimate signer of an unlisted key
+	h.sendRegister("alpha", priv, time.Now().Unix())
+
+	expectDeny(t, h, "not_authorized")
 }
 
 // --------------------------------------------------------------------------
