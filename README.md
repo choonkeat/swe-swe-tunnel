@@ -62,7 +62,6 @@ DNS-provider credentials are read from the lego provider's standard env vars (e.
 | `--unique` | `SWE_TUNNEL_UNIQUE` | — | yes | Bare label; server appends `-tunnel` (see "Naming"). |
 | `--target` | — | `127.0.0.1` | no | Forward target host. Port comes from the leftmost Host label. |
 | `--identity-key` | `SWE_TUNNEL_KEY` | `~/.swe-swe-tunnel/identity.key` | no | Ed25519 private key. Auto-generated on first run. |
-| `--ports` | `SWE_TUNNEL_PORTS` | (built-in safe set) | no | (deprecated; the server owns the port allowlist as of `--allowed-ports` — kept until commit 3 of `tasks/2026-05-02-server-side-port-allowlist.md`) Comma-separated allowlist of forwardable ports (ranges OK: `3000-3099`); `all` disables the gate. |
 | `--report-format` | `SWE_TUNNEL_REPORT_FORMAT` | `none` | no | Structured event stream on stdout: `none` or `jsonl`. See `tasks/2026-04-29-supervisor-event-protocol.md`. |
 | `--insecure` | — | `false` | no | Skip TLS verification. Testing only. |
 

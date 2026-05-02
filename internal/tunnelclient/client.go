@@ -29,7 +29,6 @@ import (
 	"github.com/hashicorp/yamux"
 
 	"github.com/choonkeat/swe-swe-tunnel/internal/control"
-	"github.com/choonkeat/swe-swe-tunnel/internal/portpolicy"
 )
 
 // DenyError wraps a server-sent Deny.Reason. Connect and Deregister
@@ -352,11 +351,14 @@ func Serve(ctx context.Context, sess *Session, handler http.Handler) error {
 // proxies to `{target}:{port}`. X-Forwarded-* headers from the upstream
 // (the public-facing tunneld) pass through unchanged.
 //
-// policy gates which ports are forwarded — anything outside the
-// allowlist returns 404 before the upstream dial, preventing the
-// public Internet from reaching every localhost port. Pass
-// portpolicy.AllowAll() to disable the gate (tests, opt-in operators).
-func PortDispatchHandler(target string, policy *portpolicy.PortPolicy, logger *slog.Logger) http.Handler {
+// As of the server-side port allowlist (see
+// tasks/2026-05-02-server-side-port-allowlist.md), the policy decision
+// lives entirely on the tunneld server: the apex operator picks one
+// allowlist that applies across all tenants, and the client
+// unconditionally proxies whatever the server sends. This handler
+// therefore performs no port gating beyond shape validation
+// (well-formed numeric port label).
+func PortDispatchHandler(target string, logger *slog.Logger) http.Handler {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -386,15 +388,8 @@ func PortDispatchHandler(target string, policy *portpolicy.PortPolicy, logger *s
 			http.Error(w, "missing port label in Host", http.StatusBadRequest)
 			return
 		}
-		n, err := strconv.Atoi(port)
-		if err != nil {
+		if _, err := strconv.Atoi(port); err != nil {
 			http.Error(w, "non-numeric port label", http.StatusBadRequest)
-			return
-		}
-		if !policy.Permits(n) {
-			logger.Warn("port not in allowlist; rejecting",
-				"port", n, "host", r.Host, "remote", r.RemoteAddr)
-			http.Error(w, "port not allowed", http.StatusNotFound)
 			return
 		}
 		rp.ServeHTTP(w, r)
