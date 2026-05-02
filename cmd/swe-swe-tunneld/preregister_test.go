@@ -177,6 +177,103 @@ func TestPreRegisterTimeout_ManyStalledConnsAreReclaimed(t *testing.T) {
 	}
 }
 
+// TestPreRegisterTimeout_LongCertIssuanceDoesNotKillSession is the
+// regression test for the conn-deadline-vs-cert-issuance bug seen in
+// production: handleRegister's cert issuance can take longer than
+// preRegisterTimeout (DNS-01 propagation routinely needs 10-60s).
+// Before the fix, the conn-level deadline expired mid-issuance,
+// killing yamux keepalives and tearing down the session even though
+// the client did everything right. After the fix, the slow-loris
+// bound is stream-scoped and gets cleared the moment a valid Register
+// frame is decoded, so the cert issuance phase has no artificial
+// time bound.
+func TestPreRegisterTimeout_LongCertIssuanceDoesNotKillSession(t *testing.T) {
+	prev := preRegisterTimeout
+	preRegisterTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { preRegisterTimeout = prev })
+
+	// fakeEnsurer that takes 4x the preRegisterTimeout to "issue" a
+	// cert. Simulates a real DNS-01 propagation delay relative to a
+	// short slow-loris bound.
+	slowEnsurer := &slowEnsurer{delay: 4 * preRegisterTimeout}
+
+	apex := "tunnel.test"
+	store, err := identity.Open(filepath.Join(t.TempDir(), "ids.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	reg := newRegistry()
+	ipLim := ratelimit.New(0, time.Hour)
+	keyLim := ratelimit.New(0, 24*time.Hour)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	mux := http.NewServeMux()
+	mux.Handle("/v1/connect", connectHandler(reg, store, slowEnsurer, apex, ipLim, keyLim, nil, logger))
+	mux.Handle("/", route(reg, apex, http.NotFoundHandler()))
+
+	tunneld := httptest.NewTLSServer(mux)
+	t.Cleanup(tunneld.Close)
+
+	roots := x509.NewCertPool()
+	roots.AddCert(tunneld.Certificate())
+	tlsCfg := &tls.Config{
+		RootCAs:    roots,
+		ServerName: mustURL(t, tunneld.URL).Hostname(),
+		MinVersion: tls.VersionTLS12,
+	}
+
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	sess, err := tunnelclient.Connect(ctx, tunnelclient.Options{
+		ServerURL:  tunneld.URL,
+		Unique:     "slowcert",
+		PrivateKey: priv,
+		TLSConfig:  tlsCfg,
+		Logger:     logger,
+	})
+	if err != nil {
+		t.Fatalf("Connect with slow cert issuance: %v "+
+			"(if 'EOF' or 'closed network connection' the conn deadline regressed)", err)
+	}
+	defer sess.Close()
+
+	// The client must hold the session past preRegisterTimeout. If the
+	// fix regressed and the conn deadline still applies, the session
+	// dies during cert issuance and Connect would have returned an
+	// error above. As a belt-and-braces check, hold for several
+	// preRegisterTimeout intervals after Connect succeeds.
+	hold := 5 * preRegisterTimeout
+	select {
+	case <-sess.CloseChan():
+		t.Fatalf("session torn down within %v of Register; "+
+			"stream-scoped pre-register deadline regressed", hold)
+	case <-time.After(hold):
+	}
+}
+
+// slowEnsurer simulates an ACME provider whose DNS-01 challenge takes
+// `delay` to satisfy. Used by TestPreRegisterTimeout_LongCertIssuance...
+// to reproduce the production bug where cert issuance outlived the
+// pre-register deadline.
+type slowEnsurer struct{ delay time.Duration }
+
+func (s *slowEnsurer) EnsureName(ctx context.Context, _ string) error {
+	select {
+	case <-time.After(s.delay):
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 // --- helpers --------------------------------------------------------
 
 func buildPreRegisterTestServer(t *testing.T) (*httptest.Server, *tls.Config) {

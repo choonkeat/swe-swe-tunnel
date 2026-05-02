@@ -194,14 +194,14 @@ func connectHandler(
 			return
 		}
 
-		// Bound the entire pre-Register phase. After Hijack, the
-		// http.Server's ReadHeaderTimeout no longer governs this conn,
-		// so without an explicit deadline an attacker who completes
-		// Upgrade but never opens a stream (or never sends Register)
-		// holds a goroutine + FD + yamux state forever. yamux itself
-		// does not set deadlines on the underlying conn, so this
-		// timeout doesn't conflict with its keepalive/read loop —
-		// it strictly applies to "no progress at all".
+		// Bound the slow-loris window. The conn-level deadline applies
+		// from Hijack through AcceptStream — until we have a yamux
+		// control stream open. Once the stream is open, we switch to a
+		// stream-scoped read deadline (set just below) so the long
+		// path inside handleRegister — including ACME cert issuance,
+		// which routinely takes 10-60 seconds during DNS-01
+		// propagation — does not kill yamux keepalives on the
+		// underlying conn.
 		preRegisterDeadline := time.Now().Add(preRegisterTimeout)
 		if err := conn.SetDeadline(preRegisterDeadline); err != nil {
 			logger.Warn("set pre-register deadline failed", "err", err)
@@ -238,17 +238,26 @@ func connectHandler(
 			return
 		}
 
-		ctx := r.Context()
-		regResult, ok := handleRegister(ctx, stream, store, certMgr, ipLimiter, pubkeyLimiter, allow, logger, conn.RemoteAddr().String())
-		if !ok {
+		// Stream is open. Slow-loris on the conn is defeated; clear
+		// the conn deadline so yamux keepalives and the long-lived
+		// data plane survive past preRegisterTimeout. Move the bound
+		// to a stream-scoped read deadline — handleRegister clears it
+		// the moment the Register frame is decoded and the sig
+		// verifies, after which the slow-loris concern is moot.
+		if err := conn.SetDeadline(time.Time{}); err != nil {
+			logger.Warn("clear conn deadline failed", "err", err)
+			_ = conn.Close()
+			return
+		}
+		if err := stream.SetReadDeadline(preRegisterDeadline); err != nil {
+			logger.Warn("set stream read deadline failed", "err", err)
+			_ = conn.Close()
 			return
 		}
 
-		// Register completed: clear the conn deadline so the long-
-		// lived data plane (browser-driven yamux streams) isn't torn
-		// down at preRegisterTimeout.
-		if err := conn.SetDeadline(time.Time{}); err != nil {
-			logger.Warn("clear post-register deadline failed", "err", err)
+		ctx := r.Context()
+		regResult, ok := handleRegister(ctx, stream, store, certMgr, ipLimiter, pubkeyLimiter, allow, logger, conn.RemoteAddr().String())
+		if !ok {
 			return
 		}
 
@@ -372,6 +381,18 @@ func handleRegister(
 	if !ed25519.Verify(pub, control.RegisterSigningPayload(pub, reg.Unique, reg.Timestamp), sig) {
 		sendDeny(stream, "signature invalid")
 		return registerResult{}, false
+	}
+
+	// Slow-loris window closes here: a valid signature proves intent.
+	// Clear the stream read deadline that connectHandler set so the
+	// rest of the flow — possibly an optional Challenge/Proof read,
+	// the post-RegisterOK control loop, and write-after-cert-issuance
+	// — can run without an artificial bound. The deadline is a
+	// no-op for io.ReadWriter implementations that don't expose
+	// SetReadDeadline (e.g. test stubs). Clearing it does not affect
+	// writes; only future reads on the stream are unbounded again.
+	if d, ok := stream.(interface{ SetReadDeadline(time.Time) error }); ok {
+		_ = d.SetReadDeadline(time.Time{})
 	}
 
 	// Allowlist gate runs *after* signature verification by design.
