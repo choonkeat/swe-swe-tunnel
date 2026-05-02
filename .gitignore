@@ -4,3 +4,10 @@
 *.test
 /swe-swe-tunneld
 .swe-swe/
+
+# Allowlist contents are per-deployment operator config (Ed25519 pubkey
+# files for the Register gate). Public keys are not secret, but they are
+# host-local policy and should NOT travel via the codebase. Anyone who
+# clones the repo gets an empty directory and must seed their own keys.
+/allowlist/*
+!/allowlist/.gitkeep
