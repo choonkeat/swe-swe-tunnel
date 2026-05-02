@@ -5,7 +5,9 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -19,6 +21,7 @@ import (
 
 	"github.com/hashicorp/yamux"
 
+	"github.com/choonkeat/swe-swe-tunnel/internal/allowlist"
 	"github.com/choonkeat/swe-swe-tunnel/internal/control"
 	"github.com/choonkeat/swe-swe-tunnel/internal/identity"
 	"github.com/choonkeat/swe-swe-tunnel/internal/ratelimit"
@@ -54,31 +57,52 @@ type tunnelSession struct {
 }
 
 // registry maps `{unique}-tunnel` labels to the live tunnel session for that
-// client.
+// client. A parallel byPubkey index lets RevokeMissing find every session
+// owned by a given key without scanning the label map.
 type registry struct {
 	mu       sync.RWMutex
 	sessions map[string]*tunnelSession
+	byPubkey map[[32]byte]map[string]*tunnelSession // pubkey → label → session
 }
 
 func newRegistry() *registry {
-	return &registry{sessions: make(map[string]*tunnelSession)}
+	return &registry{
+		sessions: make(map[string]*tunnelSession),
+		byPubkey: make(map[[32]byte]map[string]*tunnelSession),
+	}
 }
 
-func (r *registry) add(label string, ts *tunnelSession) error {
+func (r *registry) add(label string, pub []byte, ts *tunnelSession) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if _, ok := r.sessions[label]; ok {
 		return fmt.Errorf("label %q already connected", label)
 	}
 	r.sessions[label] = ts
+	var k [32]byte
+	copy(k[:], pub)
+	if r.byPubkey[k] == nil {
+		r.byPubkey[k] = make(map[string]*tunnelSession)
+	}
+	r.byPubkey[k][label] = ts
 	return nil
 }
 
-func (r *registry) remove(label string, ts *tunnelSession) {
+func (r *registry) remove(label string, pub []byte, ts *tunnelSession) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if cur, ok := r.sessions[label]; ok && cur == ts {
 		delete(r.sessions, label)
+	}
+	var k [32]byte
+	copy(k[:], pub)
+	if m := r.byPubkey[k]; m != nil {
+		if cur, ok := m[label]; ok && cur == ts {
+			delete(m, label)
+		}
+		if len(m) == 0 {
+			delete(r.byPubkey, k)
+		}
 	}
 }
 
@@ -86,6 +110,42 @@ func (r *registry) get(label string) *tunnelSession {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.sessions[label]
+}
+
+// RevokeMissing closes every live session whose authenticated pubkey is no
+// longer in allow. The yamux Close happens *outside* the registry lock —
+// Close writes a GoAway frame and waits briefly for ACK, so blocking
+// add/remove callers behind it would stall the control plane during a
+// reload. The eventual reg.remove triggered by connectHandler's deferred
+// cleanup (when <-sess.CloseChan() fires) prunes the index entry the
+// normal way.
+//
+// Safe to call when allow is nil (gate disabled) — no-op.
+func (r *registry) RevokeMissing(allow *allowlist.Set, logger *slog.Logger) {
+	if allow == nil {
+		return
+	}
+	type victim struct {
+		label string
+		fp    string
+		ts    *tunnelSession
+	}
+	var victims []victim
+	r.mu.RLock()
+	for k, byLabel := range r.byPubkey {
+		if !allow.Contains(k[:]) {
+			fp := fingerprint(k[:])
+			for label, ts := range byLabel {
+				victims = append(victims, victim{label: label, fp: fp, ts: ts})
+			}
+		}
+	}
+	r.mu.RUnlock()
+	for _, v := range victims {
+		logger.Warn("session terminated: revoked",
+			"label", v.label, "pubkey_fp", v.fp)
+		_ = v.ts.sess.Close()
+	}
 }
 
 // connectHandler returns the http.Handler for POST /v1/connect.
@@ -192,11 +252,11 @@ func connectHandler(
 		}
 
 		ts := &tunnelSession{sess: sess, proxy: newSessionProxy(sess, logger)}
-		if err := reg.add(regResult.label, ts); err != nil {
+		if err := reg.add(regResult.label, regResult.pubkey, ts); err != nil {
 			sendDeny(stream, err.Error())
 			return
 		}
-		defer reg.remove(regResult.label, ts)
+		defer reg.remove(regResult.label, regResult.pubkey, ts)
 
 		if err := control.WriteMessage(stream, control.KindRegisterOK, control.RegisterOK{
 			Hostname: regResult.label + "." + apex,
@@ -417,6 +477,16 @@ func handleRegister(
 
 func sendDeny(w io.Writer, reason string) {
 	_ = control.WriteMessage(w, control.KindDeny, control.Deny{Reason: reason})
+}
+
+// fingerprint returns a short, copy-pasteable identifier for an Ed25519
+// pubkey: the first 6 bytes of its SHA-256 as hex (12 chars). Same shape
+// the client emits at boot so an operator can cross-reference deny logs
+// against a friend's reported boot fingerprint without needing the full
+// pubkey.
+func fingerprint(pub []byte) string {
+	sum := sha256.Sum256(pub)
+	return hex.EncodeToString(sum[:6])
 }
 
 // sendRateLimitDeny is sendDeny + a server-supplied retry-after hint
