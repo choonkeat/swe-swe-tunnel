@@ -44,12 +44,22 @@ func TestParse(t *testing.T) {
 			wantPermit: []int{1977, 3000, 3099, 8080},
 			wantReject: []int{22, 1976, 3100, 8081},
 		},
-		"defaults-include-9898-and-not-dangerous-ports": {
-			spec:       DefaultSpec,
-			wantPermit: []int{1977, 3000, 4000, 8080, 9898},
-			// SSH, Postgres, Redis, Docker daemon, MySQL, Mongo etc.
-			// must NOT be in the default policy.
-			wantReject: []int{22, 23, 25, 2375, 2376, 3306, 5432, 6379, 11211, 27017},
+		"defaults-include-9898-and-20000-29999": {
+			spec: DefaultSpec,
+			// 25000 is a mid-range sentinel for the 20000-29999 band
+			// (swe-swe per-session proxy ports). Future-proofs against
+			// accidentally narrowing the default.
+			wantPermit: []int{1977, 3000, 4000, 8080, 9898, 20000, 25000, 29999},
+			// Privileged + canonical service ports that must NOT be in
+			// the default policy. Note: the wider 20000-29999 band
+			// added for swe-swe per-session proxies *does* include
+			// some service defaults (e.g. MongoDB 27017, RethinkDB
+			// 28015). That trade-off is intentional — the band is
+			// load-bearing for the canonical consumer; operators who
+			// run those services on default ports AND want
+			// swe-swe-tunnel must override the policy via
+			// --allowed-ports / --allowed-ports-file.
+			wantReject: []int{22, 23, 25, 2375, 2376, 3306, 5432, 6379, 11211, 19999, 30000},
 		},
 		"whitespace-tolerant": {
 			spec:       " 1977 , 3000 - 3099 ",

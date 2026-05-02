@@ -49,7 +49,7 @@ go build -o bin/swe-swe-tunnel ./cmd/swe-swe-tunnel
 | `--register-rate-ip-per-hour` | — | `5` | no | Per-IP REGISTER limit. `0` disables. |
 | `--register-rate-pubkey-per-day` | — | `10` | no | Per-pubkey REGISTER limit. `0` disables. |
 | `--allowlist-dir` | `SWE_TUNNEL_ALLOWLIST_DIR` | (off) | no | Directory of authorized pubkey files; gates Register. See "Access control" below. |
-| `--allowed-ports` | `SWE_TUNNEL_ALLOWED_PORTS` | `1977,3000-3099,4000-4099,5000-5099,5173,8000-8099,8080,8081,9898` | no | Inline destination-port allowlist; `all` disables the gate. Restart-only. |
+| `--allowed-ports` | `SWE_TUNNEL_ALLOWED_PORTS` | `1977,3000-3099,4000-4099,5000-5099,5173,8000-8099,8080,8081,9898,20000-29999` | no | Inline destination-port allowlist; `all` disables the gate. Restart-only. |
 | `--allowed-ports-file` | `SWE_TUNNEL_ALLOWED_PORTS_FILE` | (off) | no | File path holding the port allowlist (multi-line + `#` comments OK). SIGHUP-reloadable. Mutually exclusive with the inline form. |
 
 DNS-provider credentials are read from the lego provider's standard env vars (e.g. `DNSIMPLE_OAUTH_TOKEN` for `dnsimple`, `CF_API_TOKEN` for cloudflare, etc.).
@@ -211,7 +211,9 @@ A peer who can't sign for the claimed pubkey gets `signature invalid` regardless
 
 ## Access control: port allowlist
 
-The destination port in `{port}.{label}-tunnel.{apex}` is gated by a server-side allowlist. The default policy is `1977,3000-3099,4000-4099,5000-5099,5173,8000-8099,8080,8081,9898` — common dev/web ports plus 9898 (swe-swe primary UI). Anything outside the policy gets `404 "port not allowed"` at the apex, **before** the request reaches the tunnel client.
+The destination port in `{port}.{label}-tunnel.{apex}` is gated by a server-side allowlist. The default policy is `1977,3000-3099,4000-4099,5000-5099,5173,8000-8099,8080,8081,9898,20000-29999` — common dev/web ports plus 9898 (swe-swe primary UI) plus the 20000-29999 band (swe-swe per-session proxies for Preview / Agent View / CDP / VNC). Anything outside the policy gets `404 "port not allowed"` at the apex, **before** the request reaches the tunnel client.
+
+> The 20000-29999 band overlaps a handful of service defaults (MongoDB 27017, RethinkDB 28015 etc.). That trade-off is intentional — the band is load-bearing for the canonical swe-swe consumer. If you run one of those services on its default port AND want `swe-swe-tunnel`, narrow the policy with `--allowed-ports` or `--allowed-ports-file`.
 
 This was previously a client-side decision (and still is, until commit 3 of the migration completes). Owning it on the server means each tunnel operator picks one policy that applies to every tenant, and clients no longer need to know which ports are reachable.
 

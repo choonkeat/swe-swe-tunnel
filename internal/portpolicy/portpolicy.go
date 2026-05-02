@@ -32,10 +32,13 @@ func AllowAll() *PortPolicy {
 
 // DefaultSpec is the conservative-but-useful baseline: covers the
 // common dev/web ports plus 9898 (swe-swe's primary UI in tunnel
-// mode, advertised as `OPEN AT https://9898.{hostname}/`). Operators
-// with services outside this set must override the inline flag/env
-// or point --allowed-ports-file at their own spec.
-const DefaultSpec = "1977,3000-3099,4000-4099,5000-5099,5173,8000-8099,8080,8081,9898"
+// mode, advertised as `OPEN AT https://9898.{hostname}/`) and the
+// 20000-29999 band (swe-swe's per-session proxy ports for Preview /
+// Agent View / CDP / VNC, derived as `proxyPortOffset + servicePort`
+// where proxyPortOffset = 20000). Operators with services outside
+// this set must override the inline flag/env or point
+// --allowed-ports-file at their own spec.
+const DefaultSpec = "1977,3000-3099,4000-4099,5000-5099,5173,8000-8099,8080,8081,9898,20000-29999"
 
 // Parse builds a PortPolicy from a comma-separated spec. Each element is
 // a single port (`8080`) or an inclusive range (`3000-3099`). The
