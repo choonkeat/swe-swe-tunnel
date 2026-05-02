@@ -85,11 +85,12 @@ func main() {
 		*allowlistDir = os.Getenv("SWE_TUNNEL_ALLOWLIST_DIR")
 	}
 
-	// --allowed-ports has a non-empty default (DefaultSpec), so the
-	// presence-check uses flag.Visit (via flagSet) rather than empty-string.
-	// SWE_TUNNEL_ALLOWED_PORTS overrides the default if no flag was passed.
-	// Same for the file form.
-	if envP, ok := os.LookupEnv("SWE_TUNNEL_ALLOWED_PORTS"); ok && !flagSet("allowed-ports") {
+	// --allowed-ports has a non-empty default (DefaultSpec). Override
+	// from env only if the env var is *non-empty* — Compose's
+	// `${VAR:-}` indirection sets the var to empty string when the
+	// operator hasn't configured anything, and an empty spec parses
+	// to deny-all. Treat empty env as "not set."
+	if envP := os.Getenv("SWE_TUNNEL_ALLOWED_PORTS"); envP != "" && !flagSet("allowed-ports") {
 		*allowedPorts = envP
 	}
 	if *allowedPortsFile == "" {
@@ -356,7 +357,7 @@ func loadPortPolicy(inline, file string) (*portpolicy.Set, error) {
 	src := "default"
 	if flagSet("allowed-ports") {
 		src = "flag"
-	} else if _, ok := os.LookupEnv("SWE_TUNNEL_ALLOWED_PORTS"); ok {
+	} else if v := os.Getenv("SWE_TUNNEL_ALLOWED_PORTS"); v != "" {
 		src = "env"
 	}
 	return portpolicy.LoadInline(inline, src)

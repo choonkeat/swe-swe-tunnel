@@ -214,3 +214,47 @@ func TestReloadPortPolicy_NilSafe(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
 	reloadPortPolicy(nil, logger) // must not panic
 }
+
+// TestLoadPortPolicy_EmptyEnvIsNotSetSource: regression for a
+// production miss where docker-compose's ${VAR:-} indirection sets
+// SWE_TUNNEL_ALLOWED_PORTS to empty string when the operator hasn't
+// configured anything. Empty spec parses to deny-all, which would
+// silently break every tunnel after a deploy. We must treat empty
+// env as "not set" -> default source is "default", and the spec is
+// the compiled-in DefaultSpec (not "").
+func TestLoadPortPolicy_EmptyEnvIsNotSetSource(t *testing.T) {
+	t.Setenv("SWE_TUNNEL_ALLOWED_PORTS", "")
+	ports, err := loadPortPolicy(portpolicy.DefaultSpec, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := ports.Source(); got != "default" {
+		t.Errorf("Source() = %q, want default (empty env should not count as 'set')", got)
+	}
+	if got := ports.Spec(); got != portpolicy.DefaultSpec {
+		t.Errorf("Spec() = %q, want %q", got, portpolicy.DefaultSpec)
+	}
+	if !ports.Permits(9898) {
+		t.Errorf("default policy must permit 9898 (the bug-triggering deny-all check)")
+	}
+}
+
+// TestLoadPortPolicy_EnvWithValueIsRespected: the corollary --
+// when env IS set to a real spec, source should be "env" and the
+// inline value should be honored.
+func TestLoadPortPolicy_EnvWithValueIsRespected(t *testing.T) {
+	t.Setenv("SWE_TUNNEL_ALLOWED_PORTS", "9999")
+	// Caller of loadPortPolicy is responsible for assigning env into
+	// inline before calling, so simulate that by passing the env
+	// value here.
+	ports, err := loadPortPolicy("9999", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := ports.Source(); got != "env" {
+		t.Errorf("Source() = %q, want env", got)
+	}
+	if !ports.Permits(9999) || ports.Permits(9898) {
+		t.Errorf("Spec=%q should permit 9999 and reject 9898", ports.Spec())
+	}
+}
