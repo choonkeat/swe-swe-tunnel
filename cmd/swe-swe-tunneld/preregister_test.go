@@ -195,7 +195,7 @@ func buildPreRegisterTestServer(t *testing.T) (*httptest.Server, *tls.Config) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	mux := http.NewServeMux()
-	mux.Handle("/v1/connect", connectHandler(reg, store, &fakeEnsurer{}, apex, ipLim, keyLim, logger))
+	mux.Handle("/v1/connect", connectHandler(reg, store, &fakeEnsurer{}, apex, ipLim, keyLim, nil, logger))
 	mux.Handle("/", route(reg, apex, http.NotFoundHandler()))
 
 	tunneld := httptest.NewTLSServer(mux)

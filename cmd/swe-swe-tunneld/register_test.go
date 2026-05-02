@@ -94,7 +94,7 @@ func (h *regHarness) start() {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	go func() {
 		res, ok := handleRegister(context.Background(), h.server,
-			h.store, h.ensurer, h.ipLim, h.keyLim, logger, "127.0.0.1:54321")
+			h.store, h.ensurer, h.ipLim, h.keyLim, nil, logger, "127.0.0.1:54321")
 		h.resultCh <- handleResult{res: res, ok: ok}
 	}()
 }

@@ -22,6 +22,7 @@ import (
 	"github.com/go-acme/lego/v4/challenge"
 	"github.com/go-acme/lego/v4/providers/dns/dnsimple"
 
+	"github.com/choonkeat/swe-swe-tunnel/internal/allowlist"
 	"github.com/choonkeat/swe-swe-tunnel/internal/cert"
 	"github.com/choonkeat/swe-swe-tunnel/internal/identity"
 	"github.com/choonkeat/swe-swe-tunnel/internal/ratelimit"
@@ -47,6 +48,13 @@ func main() {
 		// prematurely.
 		dnsPropagationTimeout = flag.Duration("dns-propagation-timeout", 5*time.Minute, "DNS-01 TXT propagation timeout passed to lego provider")
 		dnsPollingInterval    = flag.Duration("dns-polling-interval", 5*time.Second, "DNS-01 TXT propagation poll interval")
+		// allowlistDir is the directory of authorized Ed25519 pubkeys. When
+		// unset, registration is open (today's behavior). When set, only
+		// keys present in some file under the directory may register; an
+		// empty directory means deny-all (explicit operator intent). Files
+		// are reloaded on SIGHUP and live sessions whose key was removed
+		// are dropped immediately.
+		allowlistDir = flag.String("allowlist-dir", "", "directory of Ed25519 pubkey files (one per line, '#' comments); enables Register gate")
 	)
 	flag.Parse()
 
@@ -62,6 +70,9 @@ func main() {
 	}
 	if env := os.Getenv("SWE_TUNNEL_STATE"); env != "" && *stateDir == defaultStateDir() {
 		*stateDir = env
+	}
+	if *allowlistDir == "" {
+		*allowlistDir = os.Getenv("SWE_TUNNEL_ALLOWLIST_DIR")
 	}
 
 	if *apex == "" || *email == "" {
@@ -153,10 +164,55 @@ func main() {
 	go ipLim.RunPruner(ctx, 15*time.Minute)
 	go keyLim.RunPruner(ctx, 15*time.Minute)
 
+	// Allowlist: optional. When set, only keys in some file under the dir
+	// may register. Loud-fail on boot: a typo'd dir must not silently fall
+	// back to open-registration. SIGHUP reloads + revokes (see goroutine
+	// below). When unset, log loudly so an operator who *thought* they
+	// turned the gate on can spot a misspelled flag at startup.
+	var allow *allowlist.Set
+	if *allowlistDir != "" {
+		var err error
+		allow, err = allowlist.Load(*allowlistDir)
+		if err != nil {
+			logger.Error("allowlist load failed", "source", *allowlistDir, "err", err)
+			os.Exit(1)
+		}
+		denyAll := ""
+		if allow.Len() == 0 {
+			denyAll = " (deny-all)"
+		}
+		logger.Info("allowlist loaded"+denyAll,
+			"source", *allowlistDir,
+			"files", allow.Files(),
+			"count", allow.Len())
+	} else {
+		logger.Info("allowlist disabled (no --allowlist-dir set; open registration)")
+	}
+
 	reg := newRegistry()
 
+	// SIGHUP reload: re-read the allowlist directory and drop any live
+	// sessions whose pubkey is no longer authorized. RevokeMissing runs
+	// only on a successful reload — a parse error means the in-memory set
+	// (and therefore policy) didn't change, so no revoke is warranted.
+	if allow != nil {
+		hupCh := make(chan os.Signal, 1)
+		signal.Notify(hupCh, syscall.SIGHUP)
+		go func() {
+			defer signal.Stop(hupCh)
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-hupCh:
+					reloadAllowlistAndRevoke(allow, reg, logger)
+				}
+			}
+		}()
+	}
+
 	mux := http.NewServeMux()
-	mux.Handle("/v1/connect", connectHandler(reg, idStore, mgr, *apex, ipLim, keyLim, logger))
+	mux.Handle("/v1/connect", connectHandler(reg, idStore, mgr, *apex, ipLim, keyLim, allow, logger))
 	mux.Handle("/", route(reg, *apex, helloHandler(*apex)))
 
 	srv := &http.Server{
@@ -222,6 +278,27 @@ func dnsProviderFactory(name string, propagationTimeout, pollingInterval time.Du
 			return nil, fmt.Errorf("unsupported dns provider %q (only dnsimple in phase 1)", name)
 		}
 	}
+}
+
+// reloadAllowlistAndRevoke re-reads the allowlist directory and, on a
+// successful reload only, drops any live sessions whose pubkey is no
+// longer authorized. A parse error logs loudly and keeps the prior set
+// in place — the in-memory policy didn't change, so no revoke is
+// warranted (a typo'd file mid-flight should not flip the gate to
+// deny-all).
+func reloadAllowlistAndRevoke(allow *allowlist.Set, reg *registry, logger *slog.Logger) {
+	added, removed, files, err := allow.Reload()
+	if err != nil {
+		logger.Error("allowlist reload failed",
+			"source", allow.Dir(), "err", err,
+			"keeping_previous", true)
+		return
+	}
+	logger.Info("allowlist reloaded",
+		"source", allow.Dir(),
+		"files", files, "count", allow.Len(),
+		"added", added, "removed", removed)
+	reg.RevokeMissing(allow, logger)
 }
 
 func defaultStateDir() string {

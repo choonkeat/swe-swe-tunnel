@@ -166,6 +166,7 @@ func connectHandler(
 	apex string,
 	ipLimiter *ratelimit.SlidingWindow,
 	pubkeyLimiter *ratelimit.SlidingWindow,
+	allow *allowlist.Set,
 	logger *slog.Logger,
 ) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -238,7 +239,7 @@ func connectHandler(
 		}
 
 		ctx := r.Context()
-		regResult, ok := handleRegister(ctx, stream, store, certMgr, ipLimiter, pubkeyLimiter, logger, conn.RemoteAddr().String())
+		regResult, ok := handleRegister(ctx, stream, store, certMgr, ipLimiter, pubkeyLimiter, allow, logger, conn.RemoteAddr().String())
 		if !ok {
 			return
 		}
@@ -308,6 +309,7 @@ func handleRegister(
 	certMgr certEnsurer,
 	ipLimiter *ratelimit.SlidingWindow,
 	pubkeyLimiter *ratelimit.SlidingWindow,
+	_ *allowlist.Set,
 	logger *slog.Logger,
 	remoteAddr string,
 ) (registerResult, bool) {

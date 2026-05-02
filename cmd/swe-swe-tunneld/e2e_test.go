@@ -60,7 +60,7 @@ func newE2ESuite(t *testing.T) *e2eSuite {
 		_, _ = w.Write([]byte("apex hello"))
 	})
 	mux := http.NewServeMux()
-	mux.Handle("/v1/connect", connectHandler(reg, store, ensurer, apex, ipLim, keyLim, logger))
+	mux.Handle("/v1/connect", connectHandler(reg, store, ensurer, apex, ipLim, keyLim, nil, logger))
 	mux.Handle("/", route(reg, apex, apexHello))
 
 	tunneld := httptest.NewTLSServer(mux)
@@ -418,7 +418,7 @@ func TestE2E_RateLimitedIP(t *testing.T) {
 	ensurer := &fakeEnsurer{}
 
 	mux := http.NewServeMux()
-	mux.Handle("/v1/connect", connectHandler(reg, store, ensurer, apex, ipLim, keyLim, logger))
+	mux.Handle("/v1/connect", connectHandler(reg, store, ensurer, apex, ipLim, keyLim, nil, logger))
 	mux.Handle("/", route(reg, apex, http.NotFoundHandler()))
 
 	tunneld := httptest.NewTLSServer(mux)
