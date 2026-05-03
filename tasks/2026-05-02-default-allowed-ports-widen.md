@@ -2,9 +2,10 @@
 
 ## Status
 
-**Proposed (2026-05-02).** Follow-up to today's
+**Shipped (2026-05-02).** Commit `26d3c56` widens `portpolicy.DefaultSpec`
+to include `20000-29999`. Follow-up to
 `2026-05-02-server-side-port-allowlist.md` (commits `3c7c157`,
-`bd12271`, `560aaf3`, `77af59b`). Surfaced by manual end-to-end
+`bd12271`, `560aaf3`, `77af59b`). Was surfaced by manual end-to-end
 testing on the consumer side after the consumer bumped
 `SWE_SWE_TUNNEL_REF` to `77af59b`.
 

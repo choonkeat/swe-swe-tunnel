@@ -2,10 +2,12 @@
 
 ## Status
 
-**Proposed (2026-05-02).** Companion follow-up:
-`tasks/2026-05-02-server-issuance-grace.md` — adds a server-side
-grace window so a Ctrl-C during cert issuance also saves an LE
-budget slot.
+**Shipped (2026-05-02).** Commit `d6d176c`. The closeOnCancel watcher
+plus the "awaiting RegisterOK" log line ship as designed; tests in
+`internal/tunnelclient/connect_cancel_test.go` cover the upgrade-,
+yamux-, and register-read stalls plus a happy-path goroutine-leak
+gate. Companion (also shipped):
+`tasks/2026-05-02-server-issuance-grace.md`.
 
 ## Why
 

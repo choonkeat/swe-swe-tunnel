@@ -2,8 +2,12 @@
 
 ## Status
 
-**Proposed (2026-05-02).** Companion to
-`tasks/2026-05-02-connect-ctx-cancel.md` (the client-side Ctrl-C fix).
+**Shipped (2026-05-02).** Commit `d5de8ef`. The 5s grace window with
+the yamux-CloseChan→ctx bridge plus rate-limit refund on bail ships
+exactly as specified. Tests in `cmd/swe-swe-tunneld/issuance_grace_test.go`
+cover the bail-during-grace, happy-path-after-grace, and
+grace=0-skips-entirely paths. Companion (also shipped):
+`tasks/2026-05-02-connect-ctx-cancel.md`.
 
 ## Why
 

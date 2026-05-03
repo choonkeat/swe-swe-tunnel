@@ -2,9 +2,12 @@
 
 ## Status
 
-**Proposed (2026-05-02).** No code changes yet; this file captures the
-scope and rationale for option (1) of the "how do I keep internet
-strangers from connecting clients to my tunneld?" discussion.
+**Shipped (2026-05-02).** Server-side pubkey allowlist landed across
+four commits: `fe4fd30` (allowlist package), `066825e` (registry
+pubkey index + RevokeMissing), `48a1c73` (`--allowlist-dir` flag +
+SIGHUP reload), `ac93ba6` (gate Register on allowlist). Operator
+workflow + docker-compose bind-mount documented in `112207d`. Live
+revoke-on-SIGHUP and deny-all-on-empty-dir behave as specified.
 
 Companion options that are *not* this task:
 

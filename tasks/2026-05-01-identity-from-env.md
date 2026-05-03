@@ -2,8 +2,12 @@
 
 ## Status
 
-**Proposed (2026-05-01).** No code changes yet; this file captures the
-scope and rationale.
+**Shipped (2026-05-02).** `SWE_TUNNEL_IDENTITY_KEY` env loader is live
+in `internal/tunnelclient/identity.go` (`LoadIdentity`,
+`parseB64Identity`, `logIdentityFingerprint`) with the precedence
+rule and disk-write regression gate exactly as specified below.
+Commits `08dc0a4` / `6031394`. Tests in `identity_test.go` cover the
+seven branches enumerated under "Tests".
 
 Companion task in the consumer repo:
 `/workspace/tasks/2026-04-29-tunnel-subprocess-pivot.md` (Update
