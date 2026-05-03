@@ -1,4 +1,8 @@
 FROM golang:1.24-alpine AS builder
+# git is required for `go build` to populate runtime/debug.ReadBuildInfo
+# vcs.revision/vcs.time. Without it, buildvcs=auto silently disables
+# and the binary reports version=unknown at boot.
+RUN apk add --no-cache git
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
