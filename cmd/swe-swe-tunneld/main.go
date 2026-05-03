@@ -27,6 +27,7 @@ import (
 	"github.com/choonkeat/swe-swe-tunnel/internal/identity"
 	"github.com/choonkeat/swe-swe-tunnel/internal/portpolicy"
 	"github.com/choonkeat/swe-swe-tunnel/internal/ratelimit"
+	"github.com/choonkeat/swe-swe-tunnel/internal/version"
 )
 
 func main() {
@@ -65,8 +66,18 @@ func main() {
 		// SWE_TUNNEL_ALLOWED_PORTS_FILE) is SIGHUP-reloadable.
 		allowedPorts     = flag.String("allowed-ports", portpolicy.DefaultSpec, "destination port allowlist (comma-separated, ranges like 3000-3099); 'all' disables the gate (DANGEROUS)")
 		allowedPortsFile = flag.String("allowed-ports-file", "", "path to a file containing the port allowlist (SIGHUP-reloadable); mutually exclusive with --allowed-ports")
+		showVersion      = flag.Bool("version", false, "print version and exit")
 	)
+	flag.Usage = func() {
+		fmt.Fprintf(flag.CommandLine.Output(), "swe-swe-tunneld %s\n\n", version.String())
+		fmt.Fprintf(flag.CommandLine.Output(), "Usage of %s:\n", os.Args[0])
+		flag.PrintDefaults()
+	}
 	flag.Parse()
+	if *showVersion {
+		fmt.Println(version.String())
+		os.Exit(0)
+	}
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)

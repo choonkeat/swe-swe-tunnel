@@ -16,6 +16,7 @@ import (
 	"syscall"
 
 	"github.com/choonkeat/swe-swe-tunnel/internal/tunnelclient"
+	"github.com/choonkeat/swe-swe-tunnel/internal/version"
 )
 
 func main() {
@@ -26,8 +27,20 @@ func main() {
 		identityKey  = flag.String("identity-key", "", "path to Ed25519 identity key (default ~/.swe-swe-tunnel/identity.key)")
 		insecure     = flag.Bool("insecure", false, "skip TLS verification (testing only)")
 		reportFormat = flag.String("report-format", "none", "supervisor event format on stdout: none|jsonl (env: SWE_TUNNEL_REPORT_FORMAT)")
+		showVersion  = flag.Bool("version", false, "print version and exit")
 	)
+	// Prefix the default usage with a version line so `-h` answers
+	// "what am I running" without a separate --version invocation.
+	flag.Usage = func() {
+		fmt.Fprintf(flag.CommandLine.Output(), "swe-swe-tunnel %s\n\n", version.String())
+		fmt.Fprintf(flag.CommandLine.Output(), "Usage of %s:\n", os.Args[0])
+		flag.PrintDefaults()
+	}
 	flag.Parse()
+	if *showVersion {
+		fmt.Println(version.String())
+		os.Exit(0)
+	}
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
