@@ -81,6 +81,7 @@ func main() {
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
+	logger.Info("starting", "binary", "swe-swe-tunneld", "version", version.String())
 
 	// Env fallback: flag wins, env fills in if flag is empty.
 	if *apex == "" {
