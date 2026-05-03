@@ -192,6 +192,7 @@ func connectHandler(
 	apex string,
 	ipLimiter *ratelimit.SlidingWindow,
 	pubkeyLimiter *ratelimit.SlidingWindow,
+	skewDenyLimiter *ratelimit.SlidingWindow,
 	allow *allowlist.Set,
 	logger *slog.Logger,
 ) http.Handler {
@@ -300,7 +301,7 @@ func connectHandler(
 			}
 		}()
 
-		regResult, ok := handleRegister(ctx, stream, store, certMgr, ipLimiter, pubkeyLimiter, allow, logger, conn.RemoteAddr().String())
+		regResult, ok := handleRegister(ctx, stream, store, certMgr, ipLimiter, pubkeyLimiter, skewDenyLimiter, allow, logger, conn.RemoteAddr().String())
 		if !ok {
 			return
 		}
@@ -363,6 +364,7 @@ func handleRegister(
 	certMgr certEnsurer,
 	ipLimiter *ratelimit.SlidingWindow,
 	pubkeyLimiter *ratelimit.SlidingWindow,
+	skewDenyLimiter *ratelimit.SlidingWindow,
 	allow *allowlist.Set,
 	logger *slog.Logger,
 	remoteAddr string,
@@ -418,6 +420,26 @@ func handleRegister(
 	now := time.Now().UTC()
 	ts := time.Unix(reg.Timestamp, 0).UTC()
 	if d := now.Sub(ts); d > maxClockSkew || -d > maxClockSkew {
+		// A skewed client clock (laptop just woke from suspend, NTP not
+		// yet synced) is benign and we'd like to refund the IP budget
+		// we consumed above — otherwise the client's exp reconnect
+		// rapidly exhausts the per-IP budget and triggers
+		// rate_limited:ip, locking the operator out for ~hour while
+		// their clock catches up.
+		//
+		// But unconditional refund is a free-pass for abuse: a single
+		// IP can hammer Register with stale timestamps without any
+		// rate-limit gate. We split the difference with a separate
+		// per-IP "skew-deny" budget. Under that cap → refund (legit
+		// drift). Over that cap → keep the burn, and the main IP
+		// limiter takes over (sustained skew failures escalate to
+		// rate_limited:ip after ~5 more attempts, which is the right
+		// signal for "your clock isn't drifting, it's broken").
+		if skewDenyLimiter == nil || skewDenyLimiter.Allow(ipKey) {
+			if ipLimiter != nil {
+				ipLimiter.CancelLatest(ipKey)
+			}
+		}
 		sendDeny(stream, "timestamp out of range")
 		return registerResult{}, false
 	}

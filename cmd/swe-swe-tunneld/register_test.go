@@ -57,7 +57,8 @@ type regHarness struct {
 	ensurer       *fakeEnsurer
 	ipLim         *ratelimit.SlidingWindow
 	keyLim        *ratelimit.SlidingWindow
-	allow         *allowlist.Set // nil = gate disabled (current behavior)
+	skewLim       *ratelimit.SlidingWindow // nil = unconditional refund on skew deny
+	allow         *allowlist.Set           // nil = gate disabled (current behavior)
 	resultCh      chan handleResult
 	logBuf        *bytes.Buffer
 }
@@ -105,7 +106,7 @@ func (h *regHarness) start() {
 	}
 	go func() {
 		res, ok := handleRegister(context.Background(), h.server,
-			store, h.ensurer, h.ipLim, h.keyLim, h.allow, logger, "127.0.0.1:54321")
+			store, h.ensurer, h.ipLim, h.keyLim, h.skewLim, h.allow, logger, "127.0.0.1:54321")
 		h.resultCh <- handleResult{res: res, ok: ok}
 	}()
 }
@@ -583,6 +584,157 @@ func TestHandleRegister_CertEnsurerFails_RefundIsKeyScoped(t *testing.T) {
 	// still be exhausted.
 	if d := h.ipLim.RetryAfter("10.0.0.99"); d == 0 {
 		t.Error("unrelated IP budget freed by cert-failure refund — refund leaked across keys")
+	}
+}
+
+// --------------------------------------------------------------------------
+// Clock-skew refund
+// --------------------------------------------------------------------------
+
+// A stale-timestamp deny is a benign client-clock symptom (laptop just woke
+// from suspend, NTP not yet synced) — not abuse. The IP budget consumed
+// before the skew check must be refunded, otherwise the client's
+// exponential reconnect quickly burns the per-IP window and the operator
+// gets locked out for ~hour while their clock catches up. Mirror of
+// TestHandleRegister_CertEnsurerFails_RefundsBothBudgets, but the pubkey
+// budget isn't checked here (the skew check runs before the pubkey-budget
+// gate inside the new-unique branch), so we only assert IP-budget intact.
+func TestHandleRegister_StaleTimestamp_RefundsIPBudget(t *testing.T) {
+	h := newRegHarness(t)
+	// Tight budget: a single un-refunded burn would deny the next attempt.
+	h.ipLim = ratelimit.New(1, time.Hour)
+	h.start()
+
+	_, priv := newKey(t)
+	h.sendRegister("alpha", priv, time.Now().Add(-time.Hour).Unix())
+	expectDeny(t, h, "timestamp out of range")
+
+	if d := h.ipLim.RetryAfter("127.0.0.1"); d != 0 {
+		t.Errorf("ipLim.RetryAfter = %v after stale-ts deny, want 0 (token refunded)", d)
+	}
+}
+
+// Sanity: stale-timestamp refund must be IP-scoped — refunding the
+// connecting IP's slot mustn't free an unrelated IP's slot.
+func TestHandleRegister_StaleTimestamp_RefundIsKeyScoped(t *testing.T) {
+	h := newRegHarness(t)
+	h.ipLim = ratelimit.New(1, time.Hour)
+	_ = h.ipLim.Allow("10.0.0.99") // pre-consume an unrelated IP's slot
+	h.start()
+
+	_, priv := newKey(t)
+	h.sendRegister("alpha", priv, time.Now().Add(-time.Hour).Unix())
+	expectDeny(t, h, "timestamp out of range")
+
+	if d := h.ipLim.RetryAfter("10.0.0.99"); d == 0 {
+		t.Error("unrelated IP budget freed by stale-ts refund — refund leaked across keys")
+	}
+}
+
+// End-to-end of the bug we're fixing: with budget N, the (N+1)-th and
+// later stale-timestamp attempts must still get "timestamp out of range",
+// NOT "rate_limited:ip" — and a follow-up attempt with a valid timestamp
+// must succeed. Without the refund this test goes red at iteration N+1
+// with "rate_limited:ip", which is exactly the cascade we hit on
+// 2026-05-03 (laptop suspend → clock drift → IP lockout).
+func TestHandleRegister_StaleTimestamp_DoesNotExhaustIPBudget(t *testing.T) {
+	_, priv := newKey(t)
+	ipLim := ratelimit.New(2, time.Hour) // tiny budget, well under the volley below
+
+	// 5 stale-timestamp attempts; without the refund the 3rd would
+	// flip to rate_limited:ip. With the refund all 5 stay benign.
+	for i := 0; i < 5; i++ {
+		h := newRegHarness(t)
+		h.ipLim = ipLim
+		h.start()
+		h.sendRegister("alpha", priv, time.Now().Add(-time.Hour).Unix())
+		expectDeny(t, h, "timestamp out of range")
+	}
+
+	// Now that the clock is "fixed", the next attempt must succeed —
+	// the budget should have spare capacity (== full, since every prior
+	// burn was refunded).
+	h := newRegHarness(t)
+	h.ipLim = ipLim
+	h.start()
+	h.sendRegister("alpha", priv, time.Now().Unix())
+	res := h.awaitResult()
+	if !res.ok {
+		t.Fatalf("post-skew register denied — refund didn't restore budget: %+v", res)
+	}
+}
+
+// Skew-deny refund is itself capped: an attacker who can reach the
+// daemon should not be able to hammer Register with stale timestamps
+// indefinitely. With a non-nil skewDenyLimiter, only the first N
+// (per-IP) skew denials get the refund; beyond N, the main IP budget
+// burns, escalating to rate_limited:ip after the main budget itself
+// runs out — the correct signal for "your clock isn't drifting, it's
+// broken / hostile."
+func TestHandleRegister_StaleTimestamp_RefundCappedBySkewLimiter(t *testing.T) {
+	_, priv := newKey(t)
+	// IP budget = 5 (matches the production default). Skew-deny refund
+	// cap = 2: only the first two skew denies get the refund.
+	ipLim := ratelimit.New(5, time.Hour)
+	skewLim := ratelimit.New(2, time.Hour)
+
+	// Attempts 1–2: under the skew cap → refund happens, IP budget intact.
+	for i := 0; i < 2; i++ {
+		h := newRegHarness(t)
+		h.ipLim = ipLim
+		h.skewLim = skewLim
+		h.start()
+		h.sendRegister("alpha", priv, time.Now().Add(-time.Hour).Unix())
+		expectDeny(t, h, "timestamp out of range")
+	}
+	if d := ipLim.RetryAfter("127.0.0.1"); d != 0 {
+		t.Errorf("after 2 skew denies under cap: ipLim.RetryAfter = %v, want 0", d)
+	}
+
+	// Attempts 3–7: skew cap exceeded → no refund. Main IP budget
+	// (size 5) gets one burn each, ending exhausted on attempt 7.
+	for i := 0; i < 5; i++ {
+		h := newRegHarness(t)
+		h.ipLim = ipLim
+		h.skewLim = skewLim
+		h.start()
+		h.sendRegister("alpha", priv, time.Now().Add(-time.Hour).Unix())
+		expectDeny(t, h, "timestamp out of range")
+	}
+
+	// Now the main IP budget should be exhausted. The next attempt
+	// hits the limiter at the *first* gate inside handleRegister and
+	// gets rate_limited:ip — even with a fresh, valid timestamp.
+	h := newRegHarness(t)
+	h.ipLim = ipLim
+	h.skewLim = skewLim
+	h.start()
+	h.sendRegister("alpha", priv, time.Now().Unix())
+	expectDeny(t, h, "rate_limited:ip")
+}
+
+// Sanity: skew-deny cap is per-IP. An attacker exhausting their own
+// skew-refund cap mustn't push another IP into the no-refund regime.
+func TestHandleRegister_StaleTimestamp_SkewLimiterIsKeyScoped(t *testing.T) {
+	skewLim := ratelimit.New(1, time.Hour)
+	// Pre-consume the unrelated IP's skew-refund slot at the limiter
+	// level (simulating that some other IP already hit a skew deny).
+	_ = skewLim.Allow("10.0.0.99")
+
+	// Our IP's first skew deny should still get the refund — the cap
+	// is per-IP, not global.
+	h := newRegHarness(t)
+	h.ipLim = ratelimit.New(1, time.Hour)
+	h.skewLim = skewLim
+	h.start()
+
+	_, priv := newKey(t)
+	h.sendRegister("alpha", priv, time.Now().Add(-time.Hour).Unix())
+	expectDeny(t, h, "timestamp out of range")
+
+	if d := h.ipLim.RetryAfter("127.0.0.1"); d != 0 {
+		t.Errorf("ipLim.RetryAfter = %v after our IP's first skew deny, want 0 "+
+			"(skew cap leaked across IPs)", d)
 	}
 }
 

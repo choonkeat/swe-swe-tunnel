@@ -41,6 +41,16 @@ func main() {
 		ensureCert       = flag.String("ensure-cert", "", "issue *.{label}.{apex} cert and exit (admin one-shot)")
 		registerIPLimit  = flag.Int("register-rate-ip-per-hour", 5, "max REGISTER attempts per source IP per hour (0 = disabled)")
 		registerKeyLimit = flag.Int("register-rate-pubkey-per-day", 10, "max REGISTER attempts per pubkey per day (0 = disabled)")
+		// Per-IP cap on how many "timestamp out of range" denies will be
+		// refunded against --register-rate-ip-per-hour before the main
+		// IP limiter starts holding the burns. A legit clock-drift case
+		// (laptop suspend) typically produces 1-3 skew denies before
+		// NTP steps the clock; 10/hour is a generous safety margin.
+		// Above the cap the main IP limiter takes over, escalating to
+		// rate_limited:ip — which is the correct signal for "your
+		// clock isn't drifting, it's broken." 0 disables the refund
+		// entirely (every skew deny burns the main budget).
+		registerSkewDenyLimit = flag.Int("register-rate-skew-deny-per-hour", 10, "max refunded 'timestamp out of range' denies per source IP per hour (0 = no refund)")
 		// Lego's defaults (PropagationTimeout=60s, PollingInterval=2s) are
 		// too tight for DNSimple's edge nameservers under load — we've seen
 		// real-world TXT propagation occasionally take 2–4 minutes, which
@@ -198,9 +208,11 @@ func main() {
 
 	ipLim := ratelimit.New(*registerIPLimit, time.Hour)
 	keyLim := ratelimit.New(*registerKeyLimit, 24*time.Hour)
+	skewLim := ratelimit.New(*registerSkewDenyLimit, time.Hour)
 	logger.Info("register rate limits",
 		"ip_per_hour", *registerIPLimit,
 		"pubkey_per_day", *registerKeyLimit,
+		"skew_deny_refund_per_hour", *registerSkewDenyLimit,
 		"max_keys", ratelimit.DefaultMaxKeys,
 	)
 
@@ -211,6 +223,7 @@ func main() {
 	// window and cheap (single map iteration).
 	go ipLim.RunPruner(ctx, 15*time.Minute)
 	go keyLim.RunPruner(ctx, 15*time.Minute)
+	go skewLim.RunPruner(ctx, 15*time.Minute)
 
 	// Allowlist: optional. When set, only keys in some file under the dir
 	// may register. Loud-fail on boot: a typo'd dir must not silently fall
@@ -264,7 +277,7 @@ func main() {
 	}()
 
 	mux := http.NewServeMux()
-	mux.Handle("/v1/connect", connectHandler(reg, idStore, mgr, *apex, ipLim, keyLim, allow, logger))
+	mux.Handle("/v1/connect", connectHandler(reg, idStore, mgr, *apex, ipLim, keyLim, skewLim, allow, logger))
 	mux.Handle("/", route(reg, *apex, ports, logger, helloHandler(*apex)))
 
 	srv := &http.Server{

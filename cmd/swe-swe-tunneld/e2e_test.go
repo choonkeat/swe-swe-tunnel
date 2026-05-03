@@ -24,9 +24,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hashicorp/yamux"
 	"golang.org/x/net/websocket"
 
 	"github.com/choonkeat/swe-swe-tunnel/internal/allowlist"
+	"github.com/choonkeat/swe-swe-tunnel/internal/control"
 	"github.com/choonkeat/swe-swe-tunnel/internal/identity"
 	"github.com/choonkeat/swe-swe-tunnel/internal/portpolicy"
 	"github.com/choonkeat/swe-swe-tunnel/internal/ratelimit"
@@ -110,7 +112,7 @@ func newE2ESuiteWith(t *testing.T, allow *allowlist.Set, allowDir string, ports 
 		_, _ = w.Write([]byte("apex hello"))
 	})
 	mux := http.NewServeMux()
-	mux.Handle("/v1/connect", connectHandler(reg, store, ensurer, apex, ipLim, keyLim, allow, logger))
+	mux.Handle("/v1/connect", connectHandler(reg, store, ensurer, apex, ipLim, keyLim, nil, allow, logger))
 	mux.Handle("/", route(reg, apex, ports, logger, apexHello))
 
 	tunneld := httptest.NewTLSServer(mux)
@@ -504,7 +506,7 @@ func TestE2E_RateLimitedIP(t *testing.T) {
 	ensurer := &fakeEnsurer{}
 
 	mux := http.NewServeMux()
-	mux.Handle("/v1/connect", connectHandler(reg, store, ensurer, apex, ipLim, keyLim, nil, logger))
+	mux.Handle("/v1/connect", connectHandler(reg, store, ensurer, apex, ipLim, keyLim, nil, nil, logger))
 	mux.Handle("/", route(reg, apex, nil, nil, http.NotFoundHandler()))
 
 	tunneld := httptest.NewTLSServer(mux)
@@ -539,6 +541,208 @@ func TestE2E_RateLimitedIP(t *testing.T) {
 	if got := ensurer.Calls(); len(got) != 0 {
 		t.Errorf("ensurer should not be called when rate-limited, got %v", got)
 	}
+}
+
+// TestE2E_StaleTimestamp_DoesNotExhaustIPBudget is the cascade-fix
+// regression: drives N raw Register frames over real TLS+yamux with
+// stale timestamps, asserts each one gets "timestamp out of range" (not
+// "rate_limited:ip"), and confirms the per-IP budget is intact at the
+// end. This is the exact failure mode we hit on 2026-05-03 — laptop
+// suspend → clock drift → daemon-side IP lockout — at the network
+// boundary, not just the handleRegister unit boundary.
+func TestE2E_StaleTimestamp_DoesNotExhaustIPBudget(t *testing.T) {
+	apex := "tunnel.test"
+	store, err := identity.Open(filepath.Join(t.TempDir(), "ids.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	reg := newRegistry()
+	// Tight budget: 2 hits per hour. Without the refund, the 3rd
+	// stale-ts attempt would flip to rate_limited:ip.
+	ipLim := ratelimit.New(2, time.Hour)
+	keyLim := ratelimit.New(0, 24*time.Hour)
+	// Generous skew-deny cap so the legit-drift path stays in effect
+	// for all 5 attempts (the cap-exceeded behaviour is tested
+	// separately).
+	skewLim := ratelimit.New(100, time.Hour)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	ensurer := &fakeEnsurer{}
+
+	mux := http.NewServeMux()
+	mux.Handle("/v1/connect", connectHandler(reg, store, ensurer, apex, ipLim, keyLim, skewLim, nil, logger))
+	mux.Handle("/", route(reg, apex, nil, nil, http.NotFoundHandler()))
+
+	tunneld := httptest.NewTLSServer(mux)
+	defer tunneld.Close()
+
+	roots := x509.NewCertPool()
+	roots.AddCert(tunneld.Certificate())
+	tlsCfg := &tls.Config{
+		RootCAs:    roots,
+		ServerName: mustURL(t, tunneld.URL).Hostname(),
+		MinVersion: tls.VersionTLS12,
+	}
+
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub := priv.Public().(ed25519.PublicKey)
+	host := mustURL(t, tunneld.URL).Host
+
+	// 5 stale-timestamp attempts — well over the 2-hit budget. Each
+	// must come back as "timestamp out of range", not rate-limited.
+	for i := 0; i < 5; i++ {
+		staleTs := time.Now().Add(-time.Hour).Unix()
+		reason := sendStaleRegister(t, host, tlsCfg, "alpha", pub, priv, staleTs)
+		if reason != "timestamp out of range" {
+			t.Fatalf("attempt %d: deny reason = %q, want %q "+
+				"(rate-limit cascade regressed)", i+1, reason, "timestamp out of range")
+		}
+	}
+
+	// Budget must still be unconsumed — every burn was refunded.
+	if d := ipLim.RetryAfter("127.0.0.1"); d != 0 {
+		t.Errorf("ipLim.RetryAfter(127.0.0.1) = %v after 5 stale-ts denies; "+
+			"want 0 — refund regressed", d)
+	}
+
+	// Sanity: the same client with a fresh timestamp must register
+	// successfully (we still have at least 2 budget slots).
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sess, err := tunnelclient.Connect(ctx, tunnelclient.Options{
+		ServerURL:  tunneld.URL,
+		Unique:     "alpha",
+		PrivateKey: priv,
+		TLSConfig:  tlsCfg,
+		Logger:     logger,
+	})
+	if err != nil {
+		t.Fatalf("post-skew Connect: %v (refund didn't restore budget)", err)
+	}
+	_ = sess.Close()
+}
+
+// TestE2E_StaleTimestamp_SkewCapEscalatesToRateLimit drives the abuse
+// case at the network boundary: with a low skew-deny cap, sustained
+// stale-ts attempts must EVENTUALLY escalate from "timestamp out of
+// range" to "rate_limited:ip" — proving the refund isn't a free-pass
+// for unbounded register hammering.
+func TestE2E_StaleTimestamp_SkewCapEscalatesToRateLimit(t *testing.T) {
+	apex := "tunnel.test"
+	store, err := identity.Open(filepath.Join(t.TempDir(), "ids.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	reg := newRegistry()
+	// Main IP budget = 3. Skew-deny refund cap = 2. Total stale-ts
+	// attempts before rate_limited:ip: 2 (refunded) + 3 (burns the
+	// main budget) = 5. The 6th attempt hits rate_limited:ip.
+	ipLim := ratelimit.New(3, time.Hour)
+	keyLim := ratelimit.New(0, 24*time.Hour)
+	skewLim := ratelimit.New(2, time.Hour)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	ensurer := &fakeEnsurer{}
+
+	mux := http.NewServeMux()
+	mux.Handle("/v1/connect", connectHandler(reg, store, ensurer, apex, ipLim, keyLim, skewLim, nil, logger))
+	mux.Handle("/", route(reg, apex, nil, nil, http.NotFoundHandler()))
+
+	tunneld := httptest.NewTLSServer(mux)
+	defer tunneld.Close()
+
+	roots := x509.NewCertPool()
+	roots.AddCert(tunneld.Certificate())
+	tlsCfg := &tls.Config{
+		RootCAs:    roots,
+		ServerName: mustURL(t, tunneld.URL).Hostname(),
+		MinVersion: tls.VersionTLS12,
+	}
+
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub := priv.Public().(ed25519.PublicKey)
+	host := mustURL(t, tunneld.URL).Host
+
+	// First 5 attempts: all stale-ts denies (the skew check fires
+	// before main budget is checked, except when the budget is
+	// already exhausted).
+	for i := 0; i < 5; i++ {
+		staleTs := time.Now().Add(-time.Hour).Unix()
+		reason := sendStaleRegister(t, host, tlsCfg, "alpha", pub, priv, staleTs)
+		if reason != "timestamp out of range" {
+			t.Fatalf("attempt %d: deny reason = %q, want 'timestamp out of range'",
+				i+1, reason)
+		}
+	}
+
+	// 6th attempt: main IP budget now exhausted; the limiter gate
+	// trips before the timestamp check, so we get rate_limited:ip.
+	staleTs := time.Now().Add(-time.Hour).Unix()
+	reason := sendStaleRegister(t, host, tlsCfg, "alpha", pub, priv, staleTs)
+	if reason != "rate_limited:ip" {
+		t.Fatalf("attempt 6: deny reason = %q, want 'rate_limited:ip' "+
+			"(skew-cap → main-IP escalation broken)", reason)
+	}
+}
+
+// sendStaleRegister opens a raw TLS+Upgrade+yamux+Register dance against
+// the tunneld at hostPort, signs a Register frame with the given
+// timestamp, reads the resulting Deny, and returns its reason. Mirrors
+// what tunnelclient.Connect does up to the point where Connect would
+// branch on success/Deny — but with caller-supplied timestamp so tests
+// can drive the clock-skew path.
+func sendStaleRegister(t *testing.T, hostPort string, tlsCfg *tls.Config,
+	unique string, pub ed25519.PublicKey, priv ed25519.PrivateKey, ts int64) string {
+	t.Helper()
+	conn, _ := dialAndUpgrade(t, hostPort, tlsCfg)
+	if conn == nil {
+		t.Fatal("dialAndUpgrade failed")
+	}
+	defer conn.Close()
+
+	cli, err := yamux.Client(conn, nil)
+	if err != nil {
+		t.Fatalf("yamux client: %v", err)
+	}
+	defer cli.Close()
+
+	stream, err := cli.OpenStream()
+	if err != nil {
+		t.Fatalf("OpenStream: %v", err)
+	}
+	defer stream.Close()
+
+	sig := ed25519.Sign(priv, control.RegisterSigningPayload(pub, unique, ts))
+	if err := control.WriteMessage(stream, control.KindRegister, control.Register{
+		Version:   control.ProtoVersion,
+		Unique:    unique,
+		Pubkey:    base64.RawStdEncoding.EncodeToString(pub),
+		Timestamp: ts,
+		Sig:       base64.RawStdEncoding.EncodeToString(sig),
+	}); err != nil {
+		t.Fatalf("write Register: %v", err)
+	}
+
+	frame, err := control.ReadFrame(stream)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	if frame.Type != control.KindDeny {
+		t.Fatalf("frame type = %q, want Deny", frame.Type)
+	}
+	var d control.Deny
+	if err := control.DecodePayload(frame, &d); err != nil {
+		t.Fatalf("decode Deny: %v", err)
+	}
+	return d.Reason
 }
 
 // --------------------------------------------------------------------------

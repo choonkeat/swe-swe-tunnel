@@ -93,7 +93,7 @@ func (h *graceHarness) start(ctx context.Context) {
 	logger := slog.New(slog.NewTextHandler(io.MultiWriter(h.logBuf), nil))
 	go func() {
 		res, ok := handleRegister(ctx, h.server, h.store, h.ensurer,
-			h.ipLim, h.keyLim, nil, logger, "127.0.0.1:54321")
+			h.ipLim, h.keyLim, nil, nil, logger, "127.0.0.1:54321")
 		h.resultCh <- handleResult{res: res, ok: ok}
 	}()
 }
