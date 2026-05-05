@@ -525,19 +525,31 @@ func handleRegister(
 		if err := certMgr.EnsureName(ctx, label); err != nil {
 			logger.Error("ensure-cert failed for new register",
 				"unique", reg.Unique, "label", label, "remote", remoteAddr, "err", err)
+			// --no-acme mode: the server has no cert on disk for this
+			// label and won't issue one. Forward as a permanent deny
+			// (the client's IsPermanent check matches the reason
+			// prefix) so a misnamed unique fails fast instead of
+			// looping. The token-refund still applies — the client
+			// did nothing wrong; the operator just hasn't provisioned
+			// the cert yet.
+			deny := "cert issuance failed"
+			if strings.HasPrefix(err.Error(), "cert not provisioned") {
+				deny = "cert not provisioned"
+			}
 			// Refund the IP and pubkey budget tokens we consumed above:
 			// cert issuance failed for server-side reasons (ACME / DNS
-			// propagation / LE rate limit), nothing the client did. Without
-			// this refund a transient cert flake would lock the operator's
-			// IP and key out for a full window — a self-inflicted DoS each
-			// time DNSimple's edge is slow.
+			// propagation / LE rate limit, or operator hasn't dropped
+			// the cert in --no-acme mode) — nothing the client did.
+			// Without this refund a transient cert flake would lock
+			// the operator's IP and key out for a full window — a
+			// self-inflicted DoS each time DNSimple's edge is slow.
 			if ipLimiter != nil {
 				ipLimiter.CancelLatest(ipKey)
 			}
 			if pubkeyLimiter != nil {
 				pubkeyLimiter.CancelLatest(string(pub))
 			}
-			sendDeny(stream, "cert issuance failed")
+			sendDeny(stream, deny)
 			return registerResult{}, false
 		}
 		if err := store.Put(ctx, reg.Unique, pub, now); err != nil {

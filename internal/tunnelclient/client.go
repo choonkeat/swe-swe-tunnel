@@ -77,6 +77,12 @@ func (e *DenyError) IsPermanent() bool {
 		strings.HasPrefix(e.Reason, "expected ") {
 		return true
 	}
+	// --no-acme mode: the server has no cert on disk for this label
+	// and won't issue one (operator owns issuance). Looping won't
+	// help — the cert isn't going to spontaneously appear.
+	if strings.HasPrefix(e.Reason, "cert not provisioned") {
+		return true
+	}
 	return false
 }
 

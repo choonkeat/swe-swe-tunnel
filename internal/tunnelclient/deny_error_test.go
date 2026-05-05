@@ -59,6 +59,8 @@ func TestDenyError_IsPermanent(t *testing.T) {
 		{"unsupported protocol version 999", true},
 		{"invalid unique \"X.Y\": must match ^[a-z]...", true},
 		{"expected register, got \"foo\"", true},
+		{"cert not provisioned", true},                  // --no-acme; operator owns issuance
+		{"cert not provisioned for alpha-tunnel", true}, // tolerate label suffix too
 
 		// Transient — should retry (or rate-limit, handled separately).
 		{"rate_limited:ip", false},

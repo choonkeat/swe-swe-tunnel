@@ -30,6 +30,18 @@ import (
 	"github.com/choonkeat/swe-swe-tunnel/internal/version"
 )
 
+// certService is the union of cert-manager methods main.go needs.
+// Both *cert.Manager and *cert.StaticLoader satisfy it; the active
+// implementation is chosen at boot from --no-acme. The narrower
+// certEnsurer interface in tunnel.go (just EnsureName) is what
+// connectHandler accepts — certService extends it with the SNI hook
+// and the disk-rescan that main owns.
+type certService interface {
+	EnsureName(ctx context.Context, label string) error
+	GetCertificate(*tls.ClientHelloInfo) (*tls.Certificate, error)
+	LoadAllFromDisk() (int, error)
+}
+
 func main() {
 	var (
 		listen           = flag.String("listen", ":443", "HTTPS listener address")
@@ -76,7 +88,12 @@ func main() {
 		// SWE_TUNNEL_ALLOWED_PORTS_FILE) is SIGHUP-reloadable.
 		allowedPorts     = flag.String("allowed-ports", portpolicy.DefaultSpec, "destination port allowlist (comma-separated, ranges like 3000-3099); 'all' disables the gate (DANGEROUS)")
 		allowedPortsFile = flag.String("allowed-ports-file", "", "path to a file containing the port allowlist (SIGHUP-reloadable); mutually exclusive with --allowed-ports")
-		showVersion      = flag.Bool("version", false, "print version and exit")
+		// no-acme: skip ACME entirely. Operator provisions certs out of
+		// band (lego CLI, certbot, cert-manager, etc.) and drops them
+		// into {state-dir}/lego/certificates/ for tunneld to serve.
+		// SIGHUP rescans the directory. See docs/manual-certs.md.
+		noAcme      = flag.Bool("no-acme", false, "skip ACME entirely; serve only pre-provisioned certs from {state-dir}/lego/certificates/ (SIGHUP-reloadable)")
+		showVersion = flag.Bool("version", false, "print version and exit")
 	)
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), "swe-swe-tunneld %s\n\n", version.String())
@@ -118,10 +135,15 @@ func main() {
 	if *allowedPortsFile == "" {
 		*allowedPortsFile = os.Getenv("SWE_TUNNEL_ALLOWED_PORTS_FILE")
 	}
+	// --no-acme has env parity with the other env-fallback flags. The
+	// flag wins; env fills in only when the flag wasn't explicitly set.
+	if !flagSet("no-acme") && os.Getenv("SWE_TUNNEL_NO_ACME") == "1" {
+		*noAcme = true
+	}
 
-	if *apex == "" || *email == "" {
+	if err := requireFlags(*apex, *email, *noAcme); err != nil {
 		flag.Usage()
-		logger.Error("--apex-domain and --acme-email are required (or SWE_TUNNEL_APEX / SWE_TUNNEL_ACME_EMAIL)")
+		logger.Error(err.Error())
 		os.Exit(2)
 	}
 
@@ -139,65 +161,84 @@ func main() {
 	}
 	logger.Info("port allowlist", "spec", ports.Spec(), "source", ports.Source())
 
-	// Wrap the lego DNS provider with our authoritative-NS pre-check so
-	// Present blocks until every authoritative NS for the apex actually
-	// serves the TXT we wrote — otherwise lego signals LE prematurely on
-	// a slow DNSimple edge and burns LE's "60 failed validations / hour"
-	// budget. See internal/cert/precheck.go for full rationale.
-	baseFactory := dnsProviderFactory(*dnsProv, *dnsPropagationTimeout, *dnsPollingInterval)
-	providerFactory := func() (challenge.Provider, error) {
-		inner, err := baseFactory()
-		if err != nil {
-			return nil, err
-		}
-		return &cert.AuthoritativePreCheck{
-			Inner:        inner,
-			Apex:         *apex,
-			WaitTimeout:  *dnsPropagationTimeout,
-			WaitInterval: *dnsPollingInterval,
-			Logger:       logger,
-		}, nil
-	}
-	mgr := cert.New(*stateDir, *email, *apex, providerFactory, logger)
-	if *staging {
-		mgr.SetStaging()
-		logger.Info("ACME staging mode (browser will not trust the cert)")
-	}
-
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	if *ensureCert != "" {
-		if err := mgr.EnsureName(ctx, *ensureCert); err != nil {
-			logger.Error("ensure-cert failed", "label", *ensureCert, "err", err)
+	// certMgr: ACME-driven *cert.Manager by default; *cert.StaticLoader
+	// when --no-acme is set. Both satisfy this interface, so the rest
+	// of main treats them uniformly: TLS hello dispatch, register-time
+	// EnsureName, SIGHUP-driven LoadAllFromDisk.
+	var certMgr certService
+
+	if *noAcme {
+		sl := cert.NewStaticLoader(*stateDir, *apex, logger)
+		certMgr = sl
+		logger.Info("ACME disabled (--no-acme); serving pre-provisioned certs only",
+			"cert_dir", filepath.Join(*stateDir, "lego", "certificates"))
+		if *ensureCert != "" {
+			logger.Info("--ensure-cert is a no-op in --no-acme mode; issuance is external (use lego/certbot directly)",
+				"label", *ensureCert)
+			return
+		}
+	} else {
+		// Wrap the lego DNS provider with our authoritative-NS pre-check so
+		// Present blocks until every authoritative NS for the apex actually
+		// serves the TXT we wrote — otherwise lego signals LE prematurely on
+		// a slow DNSimple edge and burns LE's "60 failed validations / hour"
+		// budget. See internal/cert/precheck.go for full rationale.
+		baseFactory := dnsProviderFactory(*dnsProv, *dnsPropagationTimeout, *dnsPollingInterval)
+		providerFactory := func() (challenge.Provider, error) {
+			inner, err := baseFactory()
+			if err != nil {
+				return nil, err
+			}
+			return &cert.AuthoritativePreCheck{
+				Inner:        inner,
+				Apex:         *apex,
+				WaitTimeout:  *dnsPropagationTimeout,
+				WaitInterval: *dnsPollingInterval,
+				Logger:       logger,
+			}, nil
+		}
+		mgr := cert.New(*stateDir, *email, *apex, providerFactory, logger)
+		if *staging {
+			mgr.SetStaging()
+			logger.Info("ACME staging mode (browser will not trust the cert)")
+		}
+
+		if *ensureCert != "" {
+			if err := mgr.EnsureName(ctx, *ensureCert); err != nil {
+				logger.Error("ensure-cert failed", "label", *ensureCert, "err", err)
+				os.Exit(1)
+			}
+			logger.Info("cert ensured", "label", *ensureCert, "hostname", *ensureCert+"."+*apex)
+			return
+		}
+
+		if err := mgr.Ensure(ctx); err != nil {
+			logger.Error("cert acquisition failed", "err", err)
 			os.Exit(1)
 		}
-		logger.Info("cert ensured", "label", *ensureCert, "hostname", *ensureCert+"."+*apex)
-		return
+
+		// Boot-time DNS sanity check. Doesn't block startup; just surfaces a
+		// loud WARN if the apex's authoritative DNS doesn't return a wildcard
+		// for multi-label names — the property documented in
+		// docs/adr/0001-dns-host-multi-label-wildcards.md.
+		cert.ProbeWildcard(ctx, *apex, cert.DefaultLookup, logger)
+
+		go func() {
+			if err := mgr.Run(ctx); err != nil && ctx.Err() == nil {
+				logger.Error("cert renewal loop exited", "err", err)
+			}
+		}()
+		certMgr = mgr
 	}
 
-	if err := mgr.Ensure(ctx); err != nil {
-		logger.Error("cert acquisition failed", "err", err)
-		os.Exit(1)
-	}
-
-	if n, err := mgr.LoadAllFromDisk(); err != nil {
+	if n, err := certMgr.LoadAllFromDisk(); err != nil {
 		logger.Warn("load-all-from-disk had errors", "err", err)
 	} else {
 		logger.Info("loaded certs from disk", "count", n)
 	}
-
-	// Boot-time DNS sanity check. Doesn't block startup; just surfaces a
-	// loud WARN if the apex's authoritative DNS doesn't return a wildcard
-	// for multi-label names — the property documented in
-	// docs/adr/0001-dns-host-multi-label-wildcards.md.
-	cert.ProbeWildcard(ctx, *apex, cert.DefaultLookup, logger)
-
-	go func() {
-		if err := mgr.Run(ctx); err != nil && ctx.Err() == nil {
-			logger.Error("cert renewal loop exited", "err", err)
-		}
-	}()
 
 	idStore, err := identity.Open(filepath.Join(*stateDir, "identities.db"))
 	if err != nil {
@@ -254,11 +295,15 @@ func main() {
 
 	// SIGHUP reload: re-read the allowlist directory (drop any live
 	// sessions whose pubkey is no longer authorized) AND re-read the
-	// port allowlist file (if file-sourced). Both are no-ops when
-	// their respective source isn't reloadable (allow is nil; ports
-	// is inline-sourced), but the signal handler is always armed so
-	// an operator who later switches to a file source doesn't have
-	// to restart to get HUP behaviour.
+	// port allowlist file (if file-sourced) AND rescan the cert
+	// directory so an operator who just dropped a freshly-issued cert
+	// (especially in --no-acme mode, but also useful as a manual
+	// override during an ACME outage) can ask tunneld to pick it up
+	// without restarting. All arms are idempotent and skip cleanly
+	// when their source isn't reloadable (allow is nil; ports is
+	// inline-sourced), but the signal handler is always armed so an
+	// operator who later switches to a file source doesn't have to
+	// restart to get HUP behaviour.
 	hupCh := make(chan os.Signal, 1)
 	signal.Notify(hupCh, syscall.SIGHUP)
 	go func() {
@@ -272,18 +317,19 @@ func main() {
 					reloadAllowlistAndRevoke(allow, reg, logger)
 				}
 				reloadPortPolicy(ports, logger)
+				reloadCerts(certMgr, logger)
 			}
 		}
 	}()
 
 	mux := http.NewServeMux()
-	mux.Handle("/v1/connect", connectHandler(reg, idStore, mgr, *apex, ipLim, keyLim, skewLim, allow, logger))
+	mux.Handle("/v1/connect", connectHandler(reg, idStore, certMgr, *apex, ipLim, keyLim, skewLim, allow, logger))
 	mux.Handle("/", route(reg, *apex, ports, logger, helloHandler(*apex)))
 
 	srv := &http.Server{
 		Addr:              *listen,
 		Handler:           mux,
-		TLSConfig:         &tls.Config{GetCertificate: mgr.GetCertificate, MinVersion: tls.VersionTLS12},
+		TLSConfig:         &tls.Config{GetCertificate: certMgr.GetCertificate, MinVersion: tls.VersionTLS12},
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       2 * time.Minute,
 	}
@@ -386,6 +432,35 @@ func loadPortPolicy(inline, file string) (*portpolicy.Set, error) {
 		src = "env"
 	}
 	return portpolicy.LoadInline(inline, src)
+}
+
+// requireFlags validates the boot-time required-flag rules. apex is
+// always required; --acme-email is required only when ACME is enabled
+// (i.e. --no-acme is not set). Pure function so it can be unit-tested
+// without spinning up the full main loop.
+func requireFlags(apex, email string, noAcme bool) error {
+	if apex == "" {
+		return fmt.Errorf("--apex-domain is required (or SWE_TUNNEL_APEX)")
+	}
+	if !noAcme && email == "" {
+		return fmt.Errorf("--acme-email is required when ACME is enabled (or SWE_TUNNEL_ACME_EMAIL); pass --no-acme to skip ACME entirely")
+	}
+	return nil
+}
+
+// reloadCerts is a SIGHUP hook for the cert table. It rescans the
+// cert directory and refreshes any entries already loaded; new files
+// are added, existing entries get the latest disk bytes. Idempotent
+// and safe to call regardless of mode — in ACME mode this lets an
+// operator manually drop a cert during an ACME outage; in --no-acme
+// mode this is the canonical way to publish a freshly-issued cert.
+func reloadCerts(certMgr certService, logger *slog.Logger) {
+	n, err := certMgr.LoadAllFromDisk()
+	if err != nil {
+		logger.Warn("cert reload failed", "err", err)
+		return
+	}
+	logger.Info("cert reload OK", "count", n)
 }
 
 // reloadPortPolicy is a SIGHUP hook for the port allowlist. For the
