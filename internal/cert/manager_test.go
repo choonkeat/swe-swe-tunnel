@@ -356,8 +356,8 @@ func TestManager_AddEntry_OverwritesIndex(t *testing.T) {
 
 	c1 := makeCert(t, "*.example.com", "example.com")
 	c2 := makeCert(t, "*.example.com", "example.com") // different bytes, same SANs
-	m.addEntry(&certEntry{cert: c1, sans: []string{"example.com", "*.example.com"}, baseName: "_.example.com"})
-	m.addEntry(&certEntry{cert: c2, sans: []string{"example.com", "*.example.com"}, baseName: "_.example.com"})
+	m.store.addEntry(&certEntry{cert: c1, sans: []string{"example.com", "*.example.com"}, baseName: "_.example.com"})
+	m.store.addEntry(&certEntry{cert: c2, sans: []string{"example.com", "*.example.com"}, baseName: "_.example.com"})
 
 	got, err := m.GetCertificate(&tls.ClientHelloInfo{ServerName: "example.com"})
 	if err != nil {

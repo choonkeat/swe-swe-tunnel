@@ -24,7 +24,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/go-acme/lego/v4/certcrypto"
@@ -51,10 +50,10 @@ type Manager struct {
 	CADirURL    string
 	NewProvider func() (challenge.Provider, error)
 
-	mu       sync.RWMutex
-	entries  map[string]*certEntry // baseName → entry
-	exact    map[string]*certEntry // exact-match SAN → entry
-	wildcard map[string]*certEntry // wildcard parent (e.g. "example.com") → entry
+	// store owns the in-memory cert table and the SNI dispatch hot
+	// path. Shared with StaticLoader's implementation so both publish
+	// identical semantics; see store.go.
+	store *certStore
 
 	// issueGroup coalesces concurrent ensureSANs calls for the same
 	// baseName. Without it, two parallel Register attempts for the same
@@ -89,9 +88,7 @@ func New(stateDir, email, apex string, newProvider func() (challenge.Provider, e
 		Apex:        apex,
 		CADirURL:    leProduction,
 		NewProvider: newProvider,
-		entries:     make(map[string]*certEntry),
-		exact:       make(map[string]*certEntry),
-		wildcard:    make(map[string]*certEntry),
+		store:       newCertStore(apex, logger),
 		logger:      logger,
 	}
 }
@@ -126,37 +123,7 @@ func (m *Manager) EnsureName(ctx context.Context, label string) error {
 // into the manager. Safe to call repeatedly; certs already loaded are
 // overwritten with the latest disk state. Returns the number of certs loaded.
 func (m *Manager) LoadAllFromDisk() (int, error) {
-	if err := os.MkdirAll(m.certDir(), 0o700); err != nil {
-		return 0, fmt.Errorf("mkdir cert dir: %w", err)
-	}
-	entries, err := os.ReadDir(m.certDir())
-	if err != nil {
-		return 0, fmt.Errorf("read cert dir: %w", err)
-	}
-	n := 0
-	for _, e := range entries {
-		name := e.Name()
-		if !strings.HasSuffix(name, ".crt") {
-			continue
-		}
-		baseName := strings.TrimSuffix(name, ".crt")
-		cert, ok, err := m.loadCertFile(baseName)
-		if err != nil {
-			m.logger.Warn("skipping cert with load error", "file", name, "err", err)
-			continue
-		}
-		if !ok {
-			continue
-		}
-		sans := dnsNamesFromCert(cert)
-		m.addEntry(&certEntry{cert: cert, sans: sans, baseName: baseName})
-		m.logger.Info("loaded cert from disk",
-			"base", baseName,
-			"sans", sans,
-			"expires_in", expiresIn(cert).Round(time.Hour))
-		n++
-	}
-	return n, nil
+	return m.store.loadAllFromDir(m.certDir())
 }
 
 // Run blocks, periodically renewing certs. Returns when ctx is canceled.
@@ -177,25 +144,7 @@ func (m *Manager) Run(ctx context.Context) error {
 // exact-match first, then a one-level wildcard match, then falls back to the
 // apex cert.
 func (m *Manager) GetCertificate(ch *tls.ClientHelloInfo) (*tls.Certificate, error) {
-	sni := normalizeSNI(ch.ServerName)
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	if e := m.exact[sni]; e != nil {
-		return e.cert, nil
-	}
-	if i := strings.Index(sni, "."); i >= 0 {
-		if e := m.wildcard[sni[i+1:]]; e != nil {
-			return e.cert, nil
-		}
-	}
-	if e := m.exact[m.Apex]; e != nil {
-		return e.cert, nil
-	}
-	if e := m.wildcard[m.Apex]; e != nil {
-		return e.cert, nil
-	}
-	return nil, fmt.Errorf("no certificate for SNI %q", ch.ServerName)
+	return m.store.getCertificate(ch)
 }
 
 func (m *Manager) ensureSANs(ctx context.Context, sans []string, baseName string) error {
@@ -210,13 +159,13 @@ func (m *Manager) ensureSANs(ctx context.Context, sans []string, baseName string
 	// singleflight group so a quiescent in-process restart that hits
 	// EnsureName(label) for many already-issued labels doesn't
 	// serialize behind one singleflight key per label.
-	if cert, ok, err := m.loadCertFile(baseName); err != nil {
+	if cert, ok, err := loadCertFile(m.certDir(), baseName); err != nil {
 		return err
 	} else if ok && expiresIn(cert) > renewBefore {
 		m.logger.Info("loaded existing cert from disk",
 			"base", baseName,
 			"expires_in", expiresIn(cert).Round(time.Hour))
-		m.addEntry(&certEntry{cert: cert, sans: dnsNamesFromCert(cert), baseName: baseName})
+		m.store.addEntry(&certEntry{cert: cert, sans: dnsNamesFromCert(cert), baseName: baseName})
 		return nil
 	}
 
@@ -227,13 +176,13 @@ func (m *Manager) ensureSANs(ctx context.Context, sans []string, baseName string
 	_, err, _ := m.issueGroup.Do(baseName, func() (any, error) {
 		// Re-check disk inside the group: a concurrent leader may
 		// have just landed it. If so, take that and skip ACME.
-		if cert, ok, err := m.loadCertFile(baseName); err != nil {
+		if cert, ok, err := loadCertFile(m.certDir(), baseName); err != nil {
 			return nil, err
 		} else if ok && expiresIn(cert) > renewBefore {
 			m.logger.Info("loaded existing cert from disk",
 				"base", baseName,
 				"expires_in", expiresIn(cert).Round(time.Hour))
-			m.addEntry(&certEntry{cert: cert, sans: dnsNamesFromCert(cert), baseName: baseName})
+			m.store.addEntry(&certEntry{cert: cert, sans: dnsNamesFromCert(cert), baseName: baseName})
 			return nil, nil
 		}
 
@@ -246,21 +195,14 @@ func (m *Manager) ensureSANs(ctx context.Context, sans []string, baseName string
 		if err != nil {
 			return nil, fmt.Errorf("obtain cert %v: %w", sans, err)
 		}
-		m.addEntry(&certEntry{cert: cert, sans: sans, baseName: baseName})
+		m.store.addEntry(&certEntry{cert: cert, sans: sans, baseName: baseName})
 		return nil, nil
 	})
 	return err
 }
 
 func (m *Manager) checkAndRenew(ctx context.Context) {
-	m.mu.RLock()
-	snapshot := make([]*certEntry, 0, len(m.entries))
-	for _, e := range m.entries {
-		snapshot = append(snapshot, e)
-	}
-	m.mu.RUnlock()
-
-	for _, e := range snapshot {
+	for _, e := range m.store.snapshot() {
 		if expiresIn(e.cert) > renewBefore {
 			continue
 		}
@@ -270,38 +212,8 @@ func (m *Manager) checkAndRenew(ctx context.Context) {
 			m.logger.Error("renewal failed", "base", e.baseName, "err", err)
 			continue
 		}
-		m.addEntry(&certEntry{cert: cert, sans: e.sans, baseName: e.baseName})
+		m.store.addEntry(&certEntry{cert: cert, sans: e.sans, baseName: e.baseName})
 		m.logger.Info("cert renewed", "base", e.baseName, "expires_in", expiresIn(cert).Round(time.Hour))
-	}
-}
-
-func (m *Manager) addEntry(e *certEntry) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if old, ok := m.entries[e.baseName]; ok {
-		m.removeEntryFromIndexLocked(old)
-	}
-	m.entries[e.baseName] = e
-	for _, name := range dnsNamesFromCert(e.cert) {
-		if strings.HasPrefix(name, "*.") {
-			m.wildcard[name[2:]] = e
-		} else {
-			m.exact[name] = e
-		}
-	}
-}
-
-func (m *Manager) removeEntryFromIndexLocked(e *certEntry) {
-	for _, name := range dnsNamesFromCert(e.cert) {
-		if strings.HasPrefix(name, "*.") {
-			if cur, ok := m.wildcard[name[2:]]; ok && cur == e {
-				delete(m.wildcard, name[2:])
-			}
-		} else {
-			if cur, ok := m.exact[name]; ok && cur == e {
-				delete(m.exact, name)
-			}
-		}
 	}
 }
 
@@ -319,34 +231,6 @@ func (m *Manager) certDir() string {
 
 func (m *Manager) apexBaseName() string {
 	return "_." + m.Apex
-}
-
-// loadCertFile reads a cert + key pair by basename. Returns ok=false if no
-// .crt file exists; an error is returned only on corruption or partial state.
-func (m *Manager) loadCertFile(baseName string) (*tls.Certificate, bool, error) {
-	crtPath := filepath.Join(m.certDir(), baseName+".crt")
-	keyPath := filepath.Join(m.certDir(), baseName+".key")
-	crt, err := os.ReadFile(crtPath)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil, false, nil
-	}
-	if err != nil {
-		return nil, false, fmt.Errorf("read crt: %w", err)
-	}
-	key, err := os.ReadFile(keyPath)
-	if err != nil {
-		return nil, false, fmt.Errorf("read key: %w", err)
-	}
-	cert, err := tls.X509KeyPair(crt, key)
-	if err != nil {
-		return nil, false, fmt.Errorf("parse keypair: %w", err)
-	}
-	leaf, err := x509.ParseCertificate(cert.Certificate[0])
-	if err != nil {
-		return nil, false, fmt.Errorf("parse leaf: %w", err)
-	}
-	cert.Leaf = leaf
-	return &cert, true, nil
 }
 
 func (m *Manager) obtain(ctx context.Context, sans []string, baseName string) (*tls.Certificate, error) {
