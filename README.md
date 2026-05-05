@@ -45,6 +45,8 @@ Done. The server now listens on `:443` and is ready to accept tunnel registratio
 
 > Other DNS-01 providers (Cloudflare, Route53, …) are a 5-line patch to `cmd/swe-swe-tunneld/main.go`. See [`docs/acme-providers.md`](docs/acme-providers.md).
 
+> Don't want to give tunneld a DNS API token? Run with `--no-acme` and provision the certs yourself (lego, certbot, cert-manager, …). See [`docs/manual-certs.md`](docs/manual-certs.md).
+
 ---
 
 ## Client quickstart
@@ -121,6 +123,7 @@ The leftmost label is the local port. To expose a different port, just visit `ht
 | All flags + env vars (server & client), naming rules | [`docs/configuration.md`](docs/configuration.md) |
 | DNS-host requirements (multi-label wildcards) | [`docs/dns-hosts.md`](docs/dns-hosts.md) |
 | ACME DNS-01 providers (adding new ones) | [`docs/acme-providers.md`](docs/acme-providers.md) |
+| Manual cert workflow (`--no-acme`) | [`docs/manual-certs.md`](docs/manual-certs.md) |
 | Pubkey allowlist + port allowlist | [`docs/access-control.md`](docs/access-control.md) |
 | Deregister (graceful release) | [`docs/deregister.md`](docs/deregister.md) |
 | State on disk | [`docs/state.md`](docs/state.md) |

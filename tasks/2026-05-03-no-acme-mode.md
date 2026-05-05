@@ -2,8 +2,9 @@
 
 ## Status
 
-**Proposed (2026-05-03).** No code changes yet; this file captures
-the scope and rationale.
+**Shipped (2026-05-04).** Originally proposed 2026-05-03; landed the
+following day in three logical commits (refactor, feature + tests,
+docs) per the sequencing below.
 
 Companion design discussion: 2026-05-03 chat thread on running
 swe-swe-tunneld in environments where the operator doesn't want to

@@ -7,11 +7,12 @@ All flags can be set via env. Every env var is also a flag, and vice versa.
 | Flag | Env | Default | Required | Notes |
 |---|---|---|---|---|
 | `--apex-domain` | `SWE_TUNNEL_APEX` | — | yes | DNS apex you control (e.g. `example.com`). All session hostnames are built under this. |
-| `--acme-email` | `SWE_TUNNEL_ACME_EMAIL` | — | yes | Account email for Let's Encrypt. |
+| `--acme-email` | `SWE_TUNNEL_ACME_EMAIL` | — | yes (unless `--no-acme`) | Account email for Let's Encrypt. Not required in `--no-acme` mode. |
+| `--no-acme` | `SWE_TUNNEL_NO_ACME` (set to `1`) | `false` | no | Skip ACME entirely; serve only pre-provisioned certs from `{state-dir}/lego/certificates/`. Operator owns issuance (lego, certbot, cert-manager). SIGHUP rescans the cert dir. See [`docs/manual-certs.md`](manual-certs.md). |
 | `--state-dir` | `SWE_TUNNEL_STATE` | `~/.swe-swe-tunnel` | no | Persistent dir: `lego/{accounts,certificates}/`, `identities.db`. |
 | `--listen` | — | `:443` | no | Address for the public listener. |
-| `--dns-provider` | — | `dnsimple` | no | lego DNS-01 provider name. See [`docs/acme-providers.md`](acme-providers.md). |
-| `--ensure-cert` | — | (off) | no | Admin one-shot: issue `*.{label}.{apex}` and exit. |
+| `--dns-provider` | — | `dnsimple` | no | lego DNS-01 provider name. See [`docs/acme-providers.md`](acme-providers.md). Inert when `--no-acme` is set. |
+| `--ensure-cert` | — | (off) | no | Admin one-shot: issue `*.{label}.{apex}` and exit. No-op in `--no-acme` mode (issuance is external). |
 | `--register-rate-ip-per-hour` | — | `5` | no | Per-IP REGISTER limit. `0` disables. |
 | `--register-rate-pubkey-per-day` | — | `10` | no | Per-pubkey REGISTER limit. `0` disables. |
 | `--allowlist-dir` | `SWE_TUNNEL_ALLOWLIST_DIR` | (off) | no | Directory of authorized pubkey files; gates Register. See [`docs/access-control.md`](access-control.md). |
