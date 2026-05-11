@@ -21,6 +21,7 @@ import (
 
 	"github.com/go-acme/lego/v4/challenge"
 	"github.com/go-acme/lego/v4/providers/dns/dnsimple"
+	"github.com/go-acme/lego/v4/providers/dns/route53"
 
 	"github.com/choonkeat/swe-swe-tunnel/internal/allowlist"
 	"github.com/choonkeat/swe-swe-tunnel/internal/cert"
@@ -384,9 +385,26 @@ func dnsProviderFactory(name string, propagationTimeout, pollingInterval time.Du
 			}
 			return dnsimple.NewDNSProviderConfig(cfg)
 		}
+	case "route53":
+		// Auth flows through the AWS SDK default credential chain
+		// (env → shared file → IMDS/IRSA/task role), so running on
+		// Lightsail/EC2/ECS-Fargate with an attached role needs zero
+		// static secrets. AWS_HOSTED_ZONE_ID is optional — lego will
+		// discover the zone from the FQDN if unset, but pinning it
+		// shaves a ListHostedZonesByName call per issuance.
+		return func() (challenge.Provider, error) {
+			cfg := route53.NewDefaultConfig()
+			if propagationTimeout > 0 {
+				cfg.PropagationTimeout = propagationTimeout
+			}
+			if pollingInterval > 0 {
+				cfg.PollingInterval = pollingInterval
+			}
+			return route53.NewDNSProviderConfig(cfg)
+		}
 	default:
 		return func() (challenge.Provider, error) {
-			return nil, fmt.Errorf("unsupported dns provider %q (only dnsimple in phase 1)", name)
+			return nil, fmt.Errorf("unsupported dns provider %q (supported: dnsimple, route53)", name)
 		}
 	}
 }

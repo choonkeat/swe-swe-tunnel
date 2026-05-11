@@ -43,7 +43,7 @@ docker logs -f swe-swe-tunneld   # first run issues *.example.com via Let's Encr
 
 Done. The server now listens on `:443` and is ready to accept tunnel registrations.
 
-> Other DNS-01 providers (Cloudflare, Route53, …) are a 5-line patch to `cmd/swe-swe-tunneld/main.go`. See [`docs/acme-providers.md`](docs/acme-providers.md).
+> Also supports `--dns-provider=route53` (uses the AWS SDK default credential chain, so IAM roles on Lightsail/EC2/ECS-Fargate work without static keys). Other lego providers (Cloudflare, …) are a 5-line patch to `cmd/swe-swe-tunneld/main.go`. See [`docs/acme-providers.md`](docs/acme-providers.md).
 
 > Don't want to give tunneld a DNS API token? Run with `--no-acme` and provision the certs yourself (lego, certbot, cert-manager, …). See [`docs/manual-certs.md`](docs/manual-certs.md).
 

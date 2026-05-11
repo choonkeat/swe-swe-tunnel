@@ -5,6 +5,13 @@ Cert issuance uses [lego](https://github.com/go-acme/lego)'s DNS-01 challenge. s
 | `--dns-provider` | Required env | Notes |
 |---|---|---|
 | `dnsimple` | `DNSIMPLE_OAUTH_TOKEN` | Default. |
+| `route53` | AWS SDK default credential chain (env `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` + `AWS_REGION`, or shared credentials file, or EC2 IMDS / ECS task role / EKS IRSA). `AWS_HOSTED_ZONE_ID` is optional — set it to skip the `ListHostedZonesByName` lookup. | IAM principal needs `route53:ChangeResourceRecordSets` + `route53:GetChange` on the zone, and `route53:ListHostedZonesByName` if `AWS_HOSTED_ZONE_ID` is not set. |
+
+## AWS Route 53
+
+When `swe-swe-tunneld` runs on AWS compute (Lightsail, EC2, ECS/Fargate, EKS), attach an instance / task role with the IAM permissions above and **set no static AWS keys**. The lego provider goes through the AWS SDK default credential chain, which picks up IMDSv2 / task-role / IRSA creds automatically — `--dns-provider=route53` is the only flag you need.
+
+DNS-01 only requires write access to the **apex zone** (to create `_acme-challenge.{apex}` TXT records). Your apex A/wildcard records can live anywhere; the cert pipeline is independent of where the user-facing wildcard points. See [`docs/dns-hosts.md`](dns-hosts.md) for the apex-resolution requirement (Route 53 is **strict** on multi-label wildcards, so you'll either need separate A records per `*.{unique}-tunnel.{apex}` or an apex on a permissive host — that's an apex-resolution question, not an ACME question).
 
 ## Adding a provider
 
