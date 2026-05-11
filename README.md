@@ -3,10 +3,10 @@
 A self-hosted reverse tunnel for [swe-swe](https://github.com/choonkeat/swe-swe) (and any localhost-bound HTTP service). One binary on a VPS, one binary on the host machine — browser traffic flows over a single `:443` listener with automatic Let's Encrypt wildcard certs.
 
 ```
-            ┌───────────────────┐                    ┌──────────────┐
- browser ──▶│  swe-swe-tunneld  │ ◀── one TLS conn ──│ swe-swe-tunnel │ ──▶ 127.0.0.1:3000
-            │  (your VPS, :443) │                    │  (your laptop) │
-            └───────────────────┘                    └──────────────┘
+  3000.alice-tunnel.example.com ──┐  ┌───────────────────┐                    ┌────────────────┐  ┌──▶ 127.0.0.1:3000
+  8000.alice-tunnel.example.com ──┼─▶│  swe-swe-tunneld  │◀── one TLS conn ──▶│ swe-swe-tunnel │──┼──▶ 127.0.0.1:8000
+  9000.alice-tunnel.example.com ──┘  │  (your VPS, :443) │                    │  (your laptop) │  └──▶ 127.0.0.1:9000
+                                     └───────────────────┘                    └────────────────┘
 ```
 
 See [`docs/design.md`](docs/design.md) for the architecture and protocol.
