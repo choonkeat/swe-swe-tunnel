@@ -44,6 +44,25 @@ type certService interface {
 }
 
 func main() {
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	slog.SetDefault(logger)
+
+	// One-shot subcommand dispatch (mtls-init / mtls-issue /
+	// mtls-sign). Runs BEFORE flag.Parse so subcommand-specific
+	// flags don't trigger the daemon's unknown-flag error. The
+	// subcommand's --dir defaults to {state-dir}/mtls; we resolve
+	// state-dir here from the env var (or the home-default) since
+	// the daemon's --state-dir flag isn't parsed yet. Operators who
+	// need a non-default state-dir for the subcommand set
+	// SWE_TUNNEL_STATE explicitly.
+	sd := os.Getenv("SWE_TUNNEL_STATE")
+	if sd == "" {
+		sd = defaultStateDir()
+	}
+	if code, handled := runSubcommand(os.Args, sd, os.Stdout, logger); handled {
+		os.Exit(code)
+	}
+
 	var (
 		listen           = flag.String("listen", ":443", "HTTPS listener address")
 		apex             = flag.String("apex-domain", "", "DNS apex (required), e.g. example.com")
@@ -113,8 +132,6 @@ func main() {
 		os.Exit(0)
 	}
 
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	slog.SetDefault(logger)
 	logger.Info("starting", "binary", "swe-swe-tunneld", "version", version.String())
 
 	// Env fallback: flag wins, env fills in if flag is empty.
