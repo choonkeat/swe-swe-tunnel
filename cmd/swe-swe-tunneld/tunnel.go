@@ -210,6 +210,19 @@ func connectHandler(
 			return
 		}
 
+		// If mTLS is on AND the peer cert's pubkey is Ed25519, capture
+		// it so handleRegister can enforce that the Register-claimed
+		// pubkey matches. Non-Ed25519 certs (operators bringing their
+		// own ECDSA/RSA agent certs in the future) bypass this check
+		// — they still need a valid signature on Register, so the
+		// existing crypto gate still applies.
+		var peerCertPub ed25519.PublicKey
+		if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
+			if ed, ok := r.TLS.PeerCertificates[0].PublicKey.(ed25519.PublicKey); ok {
+				peerCertPub = ed
+			}
+		}
+
 		hj, ok := w.(http.Hijacker)
 		if !ok {
 			http.Error(w, "hijack not supported", http.StatusInternalServerError)
@@ -301,7 +314,7 @@ func connectHandler(
 			}
 		}()
 
-		regResult, ok := handleRegister(ctx, stream, store, certMgr, ipLimiter, pubkeyLimiter, skewDenyLimiter, allow, logger, conn.RemoteAddr().String())
+		regResult, ok := handleRegister(ctx, stream, store, certMgr, ipLimiter, pubkeyLimiter, skewDenyLimiter, allow, logger, conn.RemoteAddr().String(), peerCertPub)
 		if !ok {
 			return
 		}
@@ -357,6 +370,13 @@ type registerResult struct {
 // handleRegister reads the Register frame, validates it, runs identity lookup
 // (with optional Challenge/Proof on pubkey mismatch), and ensures the
 // per-session cert exists. Sends Deny on any failure path.
+//
+// peerCertPub is the TLS peer cert's Ed25519 pubkey when mTLS is on
+// and the cert is Ed25519; nil otherwise. When non-nil, the Register
+// pubkey MUST equal it — a TLS-authenticated identity claiming to
+// register a different identity is a configuration error (or a
+// hostile attempt to ride one cert to register another key). Deny
+// shape mirrors the existing allowlist refusal: not_authorized.
 func handleRegister(
 	ctx context.Context,
 	stream io.ReadWriter,
@@ -368,6 +388,7 @@ func handleRegister(
 	allow *allowlist.Set,
 	logger *slog.Logger,
 	remoteAddr string,
+	peerCertPub ed25519.PublicKey,
 ) (registerResult, bool) {
 	frame, err := control.ReadFrame(stream)
 	if err != nil {
@@ -446,6 +467,23 @@ func handleRegister(
 
 	if !ed25519.Verify(pub, control.RegisterSigningPayload(pub, reg.Unique, reg.Timestamp), sig) {
 		sendDeny(stream, "signature invalid")
+		return registerResult{}, false
+	}
+
+	// mTLS layer: when a verified peer cert is present, the Register
+	// pubkey MUST equal the cert's pubkey. The agent's identity.key
+	// is intentionally the TLS key (one keypair, two uses), so any
+	// disagreement is either a misconfigured agent or a peer trying
+	// to ride one TLS cert to register a different identity. Wire
+	// reason matches the allowlist refusal; log context names the
+	// distinct cause for operator triage.
+	if peerCertPub != nil && !bytes.Equal(peerCertPub, pub) {
+		logger.Warn("register denied: not_authorized",
+			"reason_detail", "cert_key_mismatch",
+			"remote", remoteAddr, "unique", reg.Unique,
+			"register_pubkey_fp", fingerprint(pub),
+			"cert_pubkey_fp", fingerprint(peerCertPub))
+		sendDeny(stream, "not_authorized")
 		return registerResult{}, false
 	}
 
@@ -785,12 +823,19 @@ func handleDeregister(
 // the client used to return when port gating lived there, so any
 // operator runbook keyed on it keeps working. A nil ports gate
 // short-circuits to "permit all" (used by tests that don't care).
+//
+// X-Client-CN and X-Client-Cert-Fingerprint are stripped on every
+// request and re-set from the verified peer cert when mTLS is on;
+// see injectClientIdentityHeaders. The strip applies even when mTLS
+// is disabled so an unaware fronting LB can't smuggle a forged
+// identity header in.
 func route(reg *registry, apex string, ports *portpolicy.Set, logger *slog.Logger, fallback http.Handler) http.Handler {
 	apex = strings.ToLower(apex)
 	if logger == nil {
 		logger = slog.Default()
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		injectClientIdentityHeaders(r)
 		host := normalizeHost(r.Host)
 		rest, ok := strings.CutSuffix(host, "."+apex)
 		if !ok || rest == "" {
@@ -824,6 +869,24 @@ func route(reg *registry, apex string, ports *portpolicy.Set, logger *slog.Logge
 		}
 		ts.proxy.ServeHTTP(w, r)
 	})
+}
+
+// injectClientIdentityHeaders strips any inbound X-Client-CN /
+// X-Client-Cert-Fingerprint and, when a verified peer cert is present
+// on r.TLS, re-sets them from that cert. Strip-then-set is
+// unconditional: even without mTLS we strip, so a fronting LB or
+// proxy can't smuggle a forged identity header through to the
+// upstream app.
+func injectClientIdentityHeaders(r *http.Request) {
+	r.Header.Del("X-Client-CN")
+	r.Header.Del("X-Client-Cert-Fingerprint")
+	if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
+		return
+	}
+	peer := r.TLS.PeerCertificates[0]
+	r.Header.Set("X-Client-CN", peer.Subject.CommonName)
+	sum := sha256.Sum256(peer.Raw)
+	r.Header.Set("X-Client-Cert-Fingerprint", "sha256:"+hex.EncodeToString(sum[:]))
 }
 
 func tunnelOffline(w http.ResponseWriter, label string) {

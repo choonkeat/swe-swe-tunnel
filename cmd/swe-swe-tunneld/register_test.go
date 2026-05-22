@@ -106,7 +106,7 @@ func (h *regHarness) start() {
 	}
 	go func() {
 		res, ok := handleRegister(context.Background(), h.server,
-			store, h.ensurer, h.ipLim, h.keyLim, h.skewLim, h.allow, logger, "127.0.0.1:54321")
+			store, h.ensurer, h.ipLim, h.keyLim, h.skewLim, h.allow, logger, "127.0.0.1:54321", nil)
 		h.resultCh <- handleResult{res: res, ok: ok}
 	}()
 }

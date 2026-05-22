@@ -93,7 +93,13 @@ func main() {
 		// band (lego CLI, certbot, cert-manager, etc.) and drops them
 		// into {state-dir}/lego/certificates/ for tunneld to serve.
 		// SIGHUP rescans the directory. See docs/manual-certs.md.
-		noAcme      = flag.Bool("no-acme", false, "skip ACME entirely; serve only pre-provisioned certs from {state-dir}/lego/certificates/ (SIGHUP-reloadable)")
+		noAcme = flag.Bool("no-acme", false, "skip ACME entirely; serve only pre-provisioned certs from {state-dir}/lego/certificates/ (SIGHUP-reloadable)")
+		// mtls-ca: path to a PEM bundle of CAs trusted for client
+		// certs on the public listener. Presence enables mTLS:
+		// tls.Config.ClientAuth = RequireAndVerifyClientCert. Empty
+		// (the default) keeps today's behaviour. SIGHUP reloads the
+		// bundle in place; load failures keep the prior pool.
+		mtlsCA      = flag.String("mtls-ca", "", "PEM bundle of CAs to trust for client certs (enables mTLS on the public listener; SIGHUP-reloadable)")
 		showVersion = flag.Bool("version", false, "print version and exit")
 	)
 	flag.Usage = func() {
@@ -140,6 +146,9 @@ func main() {
 	// flag wins; env fills in only when the flag wasn't explicitly set.
 	if !flagSet("no-acme") && os.Getenv("SWE_TUNNEL_NO_ACME") == "1" {
 		*noAcme = true
+	}
+	if *mtlsCA == "" {
+		*mtlsCA = os.Getenv("SWE_TUNNEL_MTLS_CA")
 	}
 
 	if err := requireFlags(*apex, *email, *noAcme); err != nil {
@@ -294,6 +303,24 @@ func main() {
 
 	reg := newRegistry()
 
+	// mTLS bundle: when --mtls-ca is set, load the CA bundle now and
+	// fail boot loudly on any error — a misconfigured bundle path must
+	// not silently produce a permissive daemon. The pool is read on
+	// every TLS handshake (through GetConfigForClient below) so SIGHUP
+	// reloads take effect for new connections without restart.
+	var mtlsB *mtlsBundle
+	if *mtlsCA != "" {
+		var err error
+		mtlsB, err = loadMtlsBundle(*mtlsCA)
+		if err != nil {
+			logger.Error("mTLS CA bundle load failed", "path", *mtlsCA, "err", err)
+			os.Exit(1)
+		}
+		logger.Info("mTLS enabled", "ca", *mtlsCA, "count", mtlsB.Count())
+	} else {
+		logger.Info("mTLS disabled (no --mtls-ca)")
+	}
+
 	// SIGHUP reload: re-read the allowlist directory (drop any live
 	// sessions whose pubkey is no longer authorized) AND re-read the
 	// port allowlist file (if file-sourced) AND rescan the cert
@@ -319,6 +346,7 @@ func main() {
 				}
 				reloadPortPolicy(ports, logger)
 				reloadCerts(certMgr, logger)
+				reloadMtlsBundle(mtlsB, logger)
 			}
 		}
 	}()
@@ -327,10 +355,33 @@ func main() {
 	mux.Handle("/v1/connect", connectHandler(reg, idStore, certMgr, *apex, ipLim, keyLim, skewLim, allow, logger))
 	mux.Handle("/", route(reg, *apex, ports, logger, helloHandler(*apex)))
 
+	tlsCfg := &tls.Config{
+		GetCertificate: certMgr.GetCertificate,
+		MinVersion:     tls.VersionTLS12,
+	}
+	if mtlsB != nil {
+		// Per-handshake hook returns a config carrying the *current*
+		// CA pool. Without GetConfigForClient, ClientCAs would be a
+		// snapshot from boot and SIGHUP reloads would not take effect
+		// on new connections. The returned config nils its own
+		// GetConfigForClient to break any recursion.
+		bundle := mtlsB
+		baseGetCert := certMgr.GetCertificate
+		tlsCfg.ClientAuth = tls.RequireAndVerifyClientCert
+		tlsCfg.GetConfigForClient = func(*tls.ClientHelloInfo) (*tls.Config, error) {
+			return &tls.Config{
+				GetCertificate: baseGetCert,
+				MinVersion:     tls.VersionTLS12,
+				ClientCAs:      bundle.Pool(),
+				ClientAuth:     tls.RequireAndVerifyClientCert,
+			}, nil
+		}
+	}
+
 	srv := &http.Server{
 		Addr:              *listen,
 		Handler:           mux,
-		TLSConfig:         &tls.Config{GetCertificate: certMgr.GetCertificate, MinVersion: tls.VersionTLS12},
+		TLSConfig:         tlsCfg,
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       2 * time.Minute,
 	}
