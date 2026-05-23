@@ -110,6 +110,17 @@ func Run(ctx context.Context, ro RunOptions) error {
 				})
 				return err
 			}
+			// Permanent TLS handshake failures (bad/missing/wrong-CA
+			// client cert, malformed PEM, key/cert mismatch) won't
+			// resolve until the operator swaps cert material on
+			// disk. Same shape as the permanent-deny arm above.
+			if isPermanentTLSError(err) {
+				em.Emit(EventFatal, FatalData{
+					Message:  fmt.Sprintf("permanent TLS error: %v", err),
+					ExitCode: 1,
+				})
+				return err
+			}
 
 			em.Emit(EventError, ErrorData{Message: err.Error(), Retryable: true})
 			if ro.MaxAttempts > 0 && attempt >= ro.MaxAttempts {

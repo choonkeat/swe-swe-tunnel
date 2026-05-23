@@ -18,6 +18,7 @@ All flags can be set via env. Every env var is also a flag, and vice versa.
 | `--allowlist-dir` | `SWE_TUNNEL_ALLOWLIST_DIR` | (off) | no | Directory of authorized pubkey files; gates Register. See [`docs/access-control.md`](access-control.md). |
 | `--allowed-ports` | `SWE_TUNNEL_ALLOWED_PORTS` | `1977,3000-3099,4000-4099,5000-5099,5173,8000-8099,8080,8081,9898,20000-29999` | no | Inline destination-port allowlist; `all` disables the gate. Restart-only. |
 | `--allowed-ports-file` | `SWE_TUNNEL_ALLOWED_PORTS_FILE` | (off) | no | File path holding the port allowlist (multi-line + `#` comments OK). SIGHUP-reloadable. Mutually exclusive with the inline form. |
+| `--mtls-ca` | `SWE_TUNNEL_MTLS_CA` | (off) | no | PEM bundle of CAs trusted for client certs. Presence enables mTLS on the public listener (`ClientAuth=RequireAndVerifyClientCert`). SIGHUP-reloadable. See [`docs/mtls.md`](mtls.md). |
 
 DNS-provider credentials are read from the lego provider's standard env vars (e.g. `DNSIMPLE_OAUTH_TOKEN` for `dnsimple`, `CF_API_TOKEN` for cloudflare, etc.).
 
@@ -28,7 +29,8 @@ DNS-provider credentials are read from the lego provider's standard env vars (e.
 | `--server` | `SWE_TUNNEL_SERVER` | — | yes | Tunneld base URL (e.g. `https://tunnel.example.com`). |
 | `--unique` | `SWE_TUNNEL_UNIQUE` | — | yes | Bare label; server appends `-tunnel` (see "Naming" below). |
 | `--target` | — | `127.0.0.1` | no | Forward target host. Port comes from the leftmost Host label. |
-| `--identity-key` | `SWE_TUNNEL_KEY` | `~/.swe-swe-tunnel/identity.key` | no | Ed25519 private key. Auto-generated on first run. |
+| `--identity-key` | `SWE_TUNNEL_KEY` | `~/.swe-swe-tunnel/identity.key` | no | Ed25519 private key. Auto-generated on first run. Also doubles as the TLS private key when `--client-cert` is set. |
+| `--client-cert` | `SWE_TUNNEL_CLIENT_CERT` | (off) | no | Path to client cert PEM for mTLS. Paired with `--identity-key` (no separate `--client-key` exists by design — one Ed25519 key per agent). See [`docs/mtls.md`](mtls.md). |
 | `--report-format` | `SWE_TUNNEL_REPORT_FORMAT` | `none` | no | Structured event stream on stdout: `none` or `jsonl`. See `tasks/2026-04-29-supervisor-event-protocol.md`. |
 | `--insecure` | — | `false` | no | Skip TLS verification. Testing only. |
 

@@ -26,6 +26,7 @@ func main() {
 		target       = flag.String("target", "127.0.0.1", "default forward target host (port comes from Host header label)")
 		identityKey  = flag.String("identity-key", "", "path to Ed25519 identity key (default ~/.swe-swe-tunnel/identity.key)")
 		insecure     = flag.Bool("insecure", false, "skip TLS verification (testing only)")
+		clientCert   = flag.String("client-cert", "", "path to client cert PEM for mTLS; the private key comes from --identity-key (env: SWE_TUNNEL_CLIENT_CERT)")
 		reportFormat = flag.String("report-format", "none", "supervisor event format on stdout: none|jsonl (env: SWE_TUNNEL_REPORT_FORMAT)")
 		showVersion  = flag.Bool("version", false, "print version and exit")
 	)
@@ -57,6 +58,9 @@ func main() {
 	if *identityKey == "" {
 		*identityKey = defaultIdentityKey()
 	}
+	if *clientCert == "" {
+		*clientCert = os.Getenv("SWE_TUNNEL_CLIENT_CERT")
+	}
 	if envRF, ok := os.LookupEnv("SWE_TUNNEL_REPORT_FORMAT"); ok && !flagSet("report-format") {
 		*reportFormat = envRF
 	}
@@ -85,9 +89,14 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	var tlsCfg *tls.Config
-	if *insecure {
-		tlsCfg = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // user opted in
+	tlsCfg, err := buildTLSConfig(*clientCert, *identityKey, *insecure)
+	if err != nil {
+		logger.Error("tls config", "err", err)
+		emitter.Emit(tunnelclient.EventFatal, tunnelclient.FatalData{
+			Message:  fmt.Sprintf("tls config: %v", err),
+			ExitCode: 1,
+		})
+		os.Exit(1)
 	}
 
 	runErr := tunnelclient.Run(ctx, tunnelclient.RunOptions{
@@ -105,6 +114,42 @@ func main() {
 		logger.Error("run", "err", runErr)
 		os.Exit(1)
 	}
+}
+
+// buildTLSConfig assembles the dial-side tls.Config from the
+// --client-cert + --identity-key + --insecure inputs. When
+// clientCert is set, the cert is paired with identityKey via
+// tls.X509KeyPair — i.e. the agent's existing identity.key doubles
+// as the TLS private key (RFC 8410, Ed25519 X.509). No
+// --client-key flag exists by design.
+//
+// Returns (nil, nil) when neither mTLS nor --insecure was requested
+// — the dial uses Go's default tls.Config and the server's normal
+// cert is verified against the system trust store.
+func buildTLSConfig(clientCertPath, identityKeyPath string, insecure bool) (*tls.Config, error) {
+	if clientCertPath == "" && !insecure {
+		return nil, nil
+	}
+	cfg := &tls.Config{MinVersion: tls.VersionTLS12}
+	if clientCertPath != "" {
+		certPEM, err := os.ReadFile(clientCertPath)
+		if err != nil {
+			return nil, fmt.Errorf("read --client-cert %s: %w", clientCertPath, err)
+		}
+		keyPEM, err := os.ReadFile(identityKeyPath)
+		if err != nil {
+			return nil, fmt.Errorf("read --identity-key %s: %w", identityKeyPath, err)
+		}
+		cert, err := tls.X509KeyPair(certPEM, keyPEM)
+		if err != nil {
+			return nil, fmt.Errorf("pair cert+key: %w", err)
+		}
+		cfg.Certificates = []tls.Certificate{cert}
+	}
+	if insecure {
+		cfg.InsecureSkipVerify = true //nolint:gosec // user opted in
+	}
+	return cfg, nil
 }
 
 // buildEmitter constructs the Emitter named by format. "none" returns a

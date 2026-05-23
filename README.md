@@ -47,6 +47,8 @@ Done. The server now listens on `:443` and is ready to accept tunnel registratio
 
 > Don't want to give tunneld a DNS API token? Run with `--no-acme` and provision the certs yourself (lego, certbot, cert-manager, …). See [`docs/manual-certs.md`](docs/manual-certs.md).
 
+> Need mutual-TLS on the public listener so only your laptop / phone / named teammates can connect? `--mtls-ca <bundle>` enables it. See [`docs/mtls.md`](docs/mtls.md).
+
 ---
 
 ## Client quickstart
@@ -125,6 +127,7 @@ The leftmost label is the local port. To expose a different port, just visit `ht
 | ACME DNS-01 providers (adding new ones) | [`docs/acme-providers.md`](docs/acme-providers.md) |
 | Manual cert workflow (`--no-acme`) | [`docs/manual-certs.md`](docs/manual-certs.md) |
 | Pubkey allowlist + port allowlist | [`docs/access-control.md`](docs/access-control.md) |
+| Mutual-TLS for browsers + agents | [`docs/mtls.md`](docs/mtls.md) |
 | Deregister (graceful release) | [`docs/deregister.md`](docs/deregister.md) |
 | State on disk | [`docs/state.md`](docs/state.md) |
 | Architecture & protocol | [`docs/design.md`](docs/design.md) |

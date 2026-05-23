@@ -2,8 +2,27 @@
 
 ## Status
 
-Planned 2026-05-21. Companion design discussion captured at
-`docs/research/mtls-design.html` (open with
+Phase 1 shipped 2026-05-23. Four commits on `main`:
+
+- `bc5de47 mtls: add Ed25519 CA + client-cert toolkit` (the
+  `internal/mtls` package + unit tests).
+- `254bc9a swe-swe-tunneld: --mtls-ca enables mTLS on the public
+  listener` (daemon flag, TLS config + `GetConfigForClient`-based
+  SIGHUP-reloadable CA pool, `injectClientIdentityHeaders` in
+  `route()`, defence-in-depth peer-cert-pubkey vs Register-pubkey
+  check in `handleRegister`, e2e tests).
+- `006cc1a swe-swe-tunneld: mtls-init / mtls-issue / mtls-sign
+  subcommands` (built-in CA toolkit dispatched before flag.Parse;
+  pubkey file accepts both SPKI PEM and base64-RawStd).
+- _commit 4_: agent CLI `--client-cert`, `isPermanentTLSError`
+  classifier in the supervisor, `docs/mtls.md` + configuration
+  table rows + README link.
+
+Phase 2 (fingerprint denylist for revocation) is unstarted — see
+"Out of scope" below.
+
+Original planned 2026-05-21. Companion design discussion captured
+at `docs/research/mtls-design.html` (open with
 `npx @choonkeat/md-serve` and visit
 `/docs/research/mtls-design.html` for the rendered mermaid
 sequence diagrams).
