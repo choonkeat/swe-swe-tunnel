@@ -216,27 +216,36 @@ func (c *CA) IssueClientCert(cn string, validFor time.Duration) (*ClientBundle, 
 	if err != nil {
 		return nil, fmt.Errorf("re-parse issued cert: %w", err)
 	}
-	// LegacyDES (SHA-1 MAC + 3DES-CBC) is the algorithm combo Apple
-	// Keychain and iOS profile installer accept; Modern2023's
-	// HMAC-SHA-256 + AES-256-CBC combo is rejected with "Unable to
-	// decode the provided data" on macOS (verified live 2026-05-23).
+	// Apple Keychain (macOS + iOS) requires an exact PKCS#12
+	// algorithm combo, verified by matching what `openssl pkcs12
+	// -export -legacy` (the canonical Apple-compatible tool)
+	// produces:
 	//
-	// `WithIterations(2048)` is load-bearing: the stock LegacyDES
-	// encoder uses macIterations=1, which macOS Keychain rejects
-	// with OSStatus -26276 ("PKCS#12 verify failure") because the
-	// MAC iteration count is below its minimum threshold.
-	// `openssl pkcs12 -export -legacy` produces files with
-	// macIterations=2048 by default for exactly this reason.
-	// WithIterations sets BOTH macIterations and
-	// encryptionIterations to the value (encryption was already
-	// 2048 in stock LegacyDES; this only changes MAC iter).
+	//   MAC:       SHA-1, iterations 2048
+	//   Cert bag:  pbeWithSHAAnd40BitRC2-CBC, iterations 2048
+	//   Key bag:   pbeWithSHAAnd3-KeyTripleDES-CBC, iterations 2048
 	//
-	// The weaker outer-container algorithms are acceptable here
-	// because the passphrase is high-entropy (18 chars over a
-	// 56-char alphabet, ~104 bits) and the .p12 is an ephemeral
-	// transport artifact — operators delete both .p12 and
-	// passphrase as soon as the target device imports.
-	p12, err := pkcs12.LegacyDES.WithIterations(2048).Encode(priv, cert, []*x509.Certificate{c.cert}, passphrase)
+	// LegacyRC2 has this exact algorithm split (RC2-40 for the
+	// public cert bag, 3DES for the private key bag), but stock
+	// uses macIterations=1, which Apple rejects with OSStatus
+	// -26276 ("PKCS#12 verify failure"). WithIterations(2048)
+	// raises both mac and encryption iter to 2048 across the
+	// board.
+	//
+	// Modern2023 (HMAC-SHA-256 + AES-256) is rejected outright
+	// by macOS ("Unable to decode the provided data");
+	// LegacyDES (3DES for BOTH bags) decodes via openssl but
+	// still fails Apple's verify with -26276 even at iter=2048.
+	// Verified live 2026-05-23 through both Keychain Access and
+	// `security import`.
+	//
+	// RC2-40 protects only the cert bag, which contains the
+	// public cert (already public information). The private key
+	// is protected by 3DES-CBC plus a high-entropy
+	// passphrase (18 chars over a 56-char unambiguous alphabet,
+	// ~104 bits) -- and the .p12 is an ephemeral transport
+	// artifact deleted as soon as the target device imports.
+	p12, err := pkcs12.LegacyRC2.WithIterations(2048).Encode(priv, cert, []*x509.Certificate{c.cert}, passphrase)
 	if err != nil {
 		return nil, fmt.Errorf("encode pkcs12: %w", err)
 	}
