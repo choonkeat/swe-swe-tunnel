@@ -245,7 +245,17 @@ func (c *CA) IssueClientCert(cn string, validFor time.Duration) (*ClientBundle, 
 	// passphrase (18 chars over a 56-char unambiguous alphabet,
 	// ~104 bits) -- and the .p12 is an ephemeral transport
 	// artifact deleted as soon as the target device imports.
-	p12, err := pkcs12.LegacyRC2.WithIterations(2048).Encode(priv, cert, []*x509.Certificate{c.cert}, passphrase)
+	// Intentionally omit the CA cert from the p12 chain (nil third
+	// arg). When the CA is Ed25519-signed, Apple Keychain's X.509
+	// parser bails on the import with OSStatus -26276 ("PKCS#12
+	// verify failure"), apparently because its strict-mode pre-flight
+	// of the chain rejects the Ed25519 signature algorithm OID even
+	// when the leaf itself is ECDSA. The leaf+key alone import
+	// cleanly. The browser doesn't need the CA cert at import time
+	// to present the leaf during a TLS handshake -- the CA only
+	// matters for chain verification on the SERVER side, which the
+	// daemon has covered via --mtls-ca.
+	p12, err := pkcs12.LegacyRC2.WithIterations(2048).Encode(priv, cert, nil, passphrase)
 	if err != nil {
 		return nil, fmt.Errorf("encode pkcs12: %w", err)
 	}

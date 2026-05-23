@@ -16,6 +16,8 @@ import (
 	"testing"
 
 	"software.sslmate.com/src/go-pkcs12"
+
+	"github.com/choonkeat/swe-swe-tunnel/internal/mtls"
 )
 
 func quietLogger() *slog.Logger {
@@ -133,20 +135,22 @@ func TestMtlsIssue_RoundTrip(t *testing.T) {
 	if cert.Subject.CommonName != "alice" {
 		t.Errorf("p12 cert CN = %q, want %q", cert.Subject.CommonName, "alice")
 	}
-	if len(caCerts) == 0 {
-		t.Fatal("p12 chain has no CA cert")
+	// p12 deliberately omits the CA from the chain (Apple Keychain
+	// rejects Ed25519-signed CA certs at import even when the leaf
+	// is ECDSA). Re-verify the leaf against the CA loaded from disk
+	// instead -- the on-disk ca.pem is the daemon's truth source.
+	if len(caCerts) != 0 {
+		t.Errorf("p12 chain has %d CA certs, want 0", len(caCerts))
 	}
-
-	// Chain verifies against the bundled CA.
-	roots := x509.NewCertPool()
-	for _, c := range caCerts {
-		roots.AddCert(c)
+	caPool, _, err := mtls.LoadCABundle(filepath.Join(stateDir, "mtls", "ca.pem"))
+	if err != nil {
+		t.Fatalf("LoadCABundle: %v", err)
 	}
 	if _, err := cert.Verify(x509.VerifyOptions{
-		Roots:     roots,
+		Roots:     caPool,
 		KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
 	}); err != nil {
-		t.Errorf("cert.Verify: %v", err)
+		t.Errorf("cert.Verify against on-disk CA: %v", err)
 	}
 }
 
