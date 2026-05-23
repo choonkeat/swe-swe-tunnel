@@ -224,6 +224,43 @@ func TestMtlsSign_ReusesPubkey_SPKI(t *testing.T) {
 	}
 }
 
+// TestMtlsSign_ReusesPubkey_AllowlistFile is the live operator
+// path that broke against the real production allowlist on
+// 2026-05-23: a pubkey file written for the daemon's allowlist
+// gate uses one base64-RawStd key per line with optional `#`
+// comments and blank lines (`internal/allowlist` format). When
+// mtls-sign rejects such a file, an operator who already runs
+// the allowlist gate has to maintain a parallel pubkey file just
+// for mTLS -- defeating the "one pubkey file works in both
+// places" property docs/mtls.md promises.
+func TestMtlsSign_AcceptsAllowlistFile(t *testing.T) {
+	stateDir := t.TempDir()
+	if code := runMtlsInit(nil, stateDir, io.Discard, quietLogger()); code != 0 {
+		t.Fatalf("init: %d", code)
+	}
+	pub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pubPath := filepath.Join(t.TempDir(), "agent.pub")
+	body := "# generated 2026-05-23\n\n" +
+		base64.RawStdEncoding.EncodeToString(pub) + "  # agent comment\n"
+	if err := os.WriteFile(pubPath, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	outFile := filepath.Join(t.TempDir(), "agent.crt")
+	code := runMtlsSign([]string{"--pubkey", pubPath, "--cn", "agent-01", "-o", outFile}, stateDir, io.Discard, quietLogger())
+	if code != 0 {
+		t.Fatalf("sign with allowlist-style file: %d", code)
+	}
+	certBytes, _ := os.ReadFile(outFile)
+	blk, _ := pem.Decode(certBytes)
+	cert, _ := x509.ParseCertificate(blk.Bytes)
+	if !bytes.Equal(cert.PublicKey.(ed25519.PublicKey), pub) {
+		t.Error("cert pubkey != input pubkey (allowlist-style path)")
+	}
+}
+
 // TestMtlsSign_ReusesPubkey_Base64 accepts the same one-line
 // base64-RawStd format the allowlist files use. Lets an operator
 // drop a single pubkey file into the allowlist dir AND sign it for

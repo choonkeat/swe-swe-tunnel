@@ -193,10 +193,13 @@ func runMtlsSign(args []string, stateDir string, stdout io.Writer, logger *slog.
 }
 
 // parseEd25519Pubkey decodes either an SPKI "PUBLIC KEY" PEM block
-// or a single-line base64-RawStd encoding of the raw 32-byte
-// Ed25519 public key. The dual-format support lets an operator
-// drop a single file into the allowlist directory AND feed the
-// same file to mtls-sign without converting.
+// or a base64-RawStd Ed25519 pubkey written in the same line-based
+// format the allowlist files use: one key per line, '#' starts an
+// end-of-line comment, blank lines are ignored. The first
+// non-blank non-comment token must base64-decode to a 32-byte
+// Ed25519 pubkey. The dual-format support lets an operator drop
+// one file into the allowlist directory AND feed the same file to
+// mtls-sign without converting.
 func parseEd25519Pubkey(data []byte) (ed25519.PublicKey, error) {
 	if blk, _ := pem.Decode(data); blk != nil {
 		ifc, err := x509.ParsePKIXPublicKey(blk.Bytes)
@@ -209,12 +212,23 @@ func parseEd25519Pubkey(data []byte) (ed25519.PublicKey, error) {
 		}
 		return pub, nil
 	}
-	raw, err := base64.RawStdEncoding.DecodeString(strings.TrimSpace(string(data)))
-	if err != nil {
-		return nil, errors.New("pubkey is neither valid PEM nor base64-RawStd")
+	for _, rawLine := range strings.Split(string(data), "\n") {
+		line := rawLine
+		if i := strings.IndexByte(line, '#'); i >= 0 {
+			line = line[:i]
+		}
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		raw, err := base64.RawStdEncoding.DecodeString(line)
+		if err != nil {
+			return nil, fmt.Errorf("base64 decode %q: %w", line, err)
+		}
+		if len(raw) != ed25519.PublicKeySize {
+			return nil, fmt.Errorf("pubkey base64 decoded %d bytes, want %d", len(raw), ed25519.PublicKeySize)
+		}
+		return ed25519.PublicKey(raw), nil
 	}
-	if len(raw) != ed25519.PublicKeySize {
-		return nil, fmt.Errorf("pubkey base64 decoded %d bytes, want %d", len(raw), ed25519.PublicKeySize)
-	}
-	return ed25519.PublicKey(raw), nil
+	return nil, errors.New("pubkey is neither valid PEM nor base64-RawStd")
 }
