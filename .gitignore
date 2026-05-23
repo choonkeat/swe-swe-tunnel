@@ -11,3 +11,11 @@
 # clones the repo gets an empty directory and must seed their own keys.
 /allowlist/*
 !/allowlist/.gitkeep
+
+# Staging area for mTLS artifacts produced by
+# /generate-mtls-p12-for-device and /generate-mtls-crt-for-client.
+# Holds .p12 + .txt (passphrase) pairs and .crt files destined for
+# browsers / agent hosts. Sensitive: .p12 contains a fresh private
+# key under passphrase, .txt is the passphrase. Delete each file as
+# soon as the target device finishes import.
+/generated/

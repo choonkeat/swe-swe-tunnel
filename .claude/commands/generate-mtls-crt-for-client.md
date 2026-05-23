@@ -1,0 +1,157 @@
+---
+description: Sign a client Ed25519 pubkey into a cert. Stages {cn}.crt under ./generated/ for the operator to ship to the agent host.
+---
+
+You are signing an **agent**'s existing Ed25519 public key into an
+mTLS client cert against the live production CA. Unlike the .p12
+flow, the agent already owns its private key (its identity.key) —
+this command never mints or sees a new private key. The output is
+just a `.crt` PEM.
+
+# Run
+
+Work from the repo root: `/repos/swe-swe-tunnel/workspace`. Do
+everything via the Bash tool. Report progress with `send_progress`
+between steps and a final `send_message` with the on-host path so
+the operator can `scp` it to the agent host.
+
+## Inputs
+
+The user invokes `/generate-mtls-crt-for-client <cn> <pubkey>`:
+
+- **`<cn>`** (required) — the agent identity label (e.g.
+  `alice`, `alice-laptop`). Becomes the Subject CN of the
+  signed cert AND the filename stem. Match `^[a-z0-9._-]{1,63}$`.
+
+- **`<pubkey>`** (required) — the Ed25519 public key in
+  base64-RawStd encoding (43 chars, no padding). This is the same
+  format `--allowlist-dir` files use, and the same format
+  `Register.Pubkey` carries on the wire.
+
+   To extract it on an agent host:
+   ```sh
+   openssl pkey -in ~/.swe-swe-tunnel/identity.key -pubout -outform DER \
+     | tail -c 32 | base64 | tr -d '='
+   ```
+
+   If the user pastes a PEM-wrapped or padded form, refuse and
+   ask for the bare 43-char base64-RawStd.
+
+If either is omitted, ask the user. Do not guess.
+
+## Validate + pre-flight
+
+Run in parallel:
+
+1. **Pubkey shape.** `printf '%s=' "<pubkey>" | base64 -d 2>/dev/null
+   | wc -c` must print `32`. Ed25519 pubkeys are 32 bytes. Fail
+   loud otherwise.
+
+2. **CN safety.** Reject `/`, `..`, leading `.`, whitespace.
+   `^[a-z0-9._-]{1,63}$`.
+
+3. **Container running.** `docker ps --format '{{.Names}}' | grep -q
+   '^swe-swe-tunneld$'`.
+
+4. **CA exists.** `docker exec swe-swe-tunneld test -f
+   /var/lib/swe-swe-tunnel/mtls/ca.pem`. If not, point at
+   `docker compose run --rm swe-swe-tunneld mtls-init`.
+
+5. **No clobber.** Check `./generated/<cn>.crt` on the HOST:
+   ```sh
+   docker run --rm -v /repos/swe-swe-tunnel/workspace/generated:/g \
+     alpine ls /g/<cn>.crt 2>/dev/null
+   ```
+   Existing file -> ask the user before overwriting. An existing
+   .crt might already be deployed to an agent host; overwriting
+   means deploying again.
+
+## Confirm with the user
+
+`send_message` summarizing:
+
+- the CN that will go on the cert,
+- the pubkey (echo it so the operator can sanity-check the paste),
+- the on-host path: `/repos/swe-swe-tunnel/workspace/generated/<cn>.crt`,
+- the implicit trust delegation (a cert is issued; the pubkey
+  becomes a recognised identity from the daemon's POV once mTLS
+  is enabled).
+
+Quick replies: `Sign` / `Cancel`.
+
+## Sign + stage
+
+After confirmation:
+
+1. `send_progress`: "signing <cn>.crt from the production CA…"
+
+2. Write the pubkey to a tmp path **inside the daemon container's
+   shared volume**, then run mtls-sign against it. Going through
+   the volume is the simplest way to give the sign subcommand a
+   readable file path it can see.
+   ```sh
+   docker exec swe-swe-tunneld sh -c 'printf "%s\n" "<pubkey>" > /var/lib/swe-swe-tunnel/mtls/<cn>.pubin'
+   docker compose run --rm swe-swe-tunneld \
+     mtls-sign \
+       --pubkey /var/lib/swe-swe-tunnel/mtls/<cn>.pubin \
+       --cn "<cn>" \
+       -o /var/lib/swe-swe-tunnel/mtls/<cn>.crt
+   docker exec swe-swe-tunneld rm /var/lib/swe-swe-tunnel/mtls/<cn>.pubin
+   ```
+   Don't pipe via stdin — mtls-sign reads from a path, and there's
+   no clean way to give a `compose run` process a file path
+   pointing at the calling shell's stdin.
+
+3. Make sure `./generated/` exists on the HOST:
+   ```sh
+   docker run --rm -v /repos/swe-swe-tunnel/workspace:/repo alpine \
+     sh -c 'mkdir -p /repo/generated'
+   ```
+
+4. Copy the signed .crt out of the volume into `./generated/`:
+   ```sh
+   docker run --rm \
+     -v /repos/swe-swe-tunnel/workspace/generated:/dst \
+     --volumes-from swe-swe-tunneld:ro \
+     alpine sh -c 'cp /var/lib/swe-swe-tunnel/mtls/<cn>.crt /dst/<cn>.crt'
+   ```
+
+5. (Recommended) **Leave the .crt in the daemon's volume too** —
+   unlike the .p12 case, a signed cert is not sensitive (it's the
+   public artifact). Keeping it in `/var/lib/swe-swe-tunnel/mtls/`
+   makes it easy to re-fetch later without re-signing.
+
+## Report
+
+Final `send_message`:
+
+- on-host path: `/repos/swe-swe-tunnel/workspace/generated/<cn>.crt`,
+- chain check (so the operator sees the daemon trusts this cert):
+  ```sh
+  docker run --rm \
+    --volumes-from swe-swe-tunneld:ro \
+    alpine sh -c 'apk add --quiet openssl && \
+      openssl verify -CAfile /var/lib/swe-swe-tunnel/mtls/ca.pem \
+        /var/lib/swe-swe-tunnel/mtls/<cn>.crt'
+  ```
+  Expected: `<cn>.crt: OK`. If anything else, surface it loudly —
+  signing-but-not-chain-verifying is a red flag.
+- on-disk size + sha256 fingerprint of the cert (purely for the
+  operator's audit log).
+- a one-line deployment hint to the operator, verbatim:
+
+  > scp /repos/swe-swe-tunnel/workspace/generated/<cn>.crt
+  >   <agent-host>:~/.swe-swe-tunnel/client.crt
+  > Then add `--client-cert ~/.swe-swe-tunnel/client.crt`
+  > (or `SWE_TUNNEL_CLIENT_CERT=...`) to the agent's launch.
+
+## Coding rules
+
+- Cert PEM is public — feel free to echo / log it.
+- The pubkey is also public (it's already in the allowlist file
+  for any registered agent).
+- Don't leave the `.pubin` tmp file in the volume; rm it after
+  mtls-sign returns regardless of exit code.
+- If mtls-sign fails (e.g. malformed pubkey, CA missing), surface
+  the error verbatim. Don't retry; agent operators want explicit
+  failures, not silent retries.
