@@ -18,7 +18,7 @@ import (
 // tls config and the server's normal cert verifies against the
 // system trust store. This is the unchanged-default path.
 func TestBuildTLSConfig_None(t *testing.T) {
-	cfg, err := buildTLSConfig("", "", false)
+	cfg, err := buildTLSConfig("", nil, false)
 	if err != nil {
 		t.Fatalf("buildTLSConfig: %v", err)
 	}
@@ -31,7 +31,7 @@ func TestBuildTLSConfig_None(t *testing.T) {
 // returns a config with InsecureSkipVerify=true and no client
 // certificates. Preserves today's --insecure-only behaviour.
 func TestBuildTLSConfig_InsecureOnly(t *testing.T) {
-	cfg, err := buildTLSConfig("", "", true)
+	cfg, err := buildTLSConfig("", nil, true)
 	if err != nil {
 		t.Fatalf("buildTLSConfig: %v", err)
 	}
@@ -47,21 +47,19 @@ func TestBuildTLSConfig_InsecureOnly(t *testing.T) {
 }
 
 // TestBuildTLSConfig_MTLS_PairsCertAndIdentityKey is the agent-mTLS
-// flow contract: --client-cert + --identity-key produce a
-// tls.Certificate that pairs the cert with the existing identity
-// private key. The agent's identity.key is reused as the TLS key
-// (RFC 8410 / Ed25519 X.509). No --client-key flag exists.
+// flow contract: --client-cert paired with the in-memory identity
+// key produces a tls.Certificate ready for the dial. The agent's
+// identity.key doubles as the TLS key (RFC 8410 / Ed25519 X.509).
+// No --client-key flag exists.
 func TestBuildTLSConfig_MTLS_PairsCertAndIdentityKey(t *testing.T) {
 	dir := t.TempDir()
-	// Generate keypair + cert that lives entirely in this test.
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
 	certPath := writeSelfSignedCert(t, dir, "agent-01", pub, priv)
-	keyPath := writeIdentityKey(t, dir, priv)
 
-	cfg, err := buildTLSConfig(certPath, keyPath, false)
+	cfg, err := buildTLSConfig(certPath, priv, false)
 	if err != nil {
 		t.Fatalf("buildTLSConfig: %v", err)
 	}
@@ -76,20 +74,45 @@ func TestBuildTLSConfig_MTLS_PairsCertAndIdentityKey(t *testing.T) {
 	}
 }
 
+// TestBuildTLSConfig_MTLS_WorksWithEnvLoadedKey is the regression
+// for the production bug surfaced on 2026-05-23: when the agent's
+// identity comes from SWE_TUNNEL_IDENTITY_KEY env (no file on
+// disk), buildTLSConfig must still pair the cert with that
+// in-memory key. The earlier file-based version of this function
+// dereferenced the empty --identity-key path and crashed at boot
+// with "no such file or directory" even though the identity had
+// been loaded successfully from the env.
+func TestBuildTLSConfig_MTLS_WorksWithEnvLoadedKey(t *testing.T) {
+	dir := t.TempDir()
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certPath := writeSelfSignedCert(t, dir, "agent-env", pub, priv)
+	// Simulate the env-key path: identity bytes are in memory, no
+	// file at any path on disk. Pass empty identity-key path; the
+	// function must NOT try to read it.
+	cfg, err := buildTLSConfig(certPath, priv, false)
+	if err != nil {
+		t.Fatalf("buildTLSConfig with in-memory key (no disk file): %v", err)
+	}
+	if cfg == nil || len(cfg.Certificates) != 1 {
+		t.Fatalf("env-loaded key produced cfg=%+v", cfg)
+	}
+}
+
 // TestBuildTLSConfig_KeyMismatchFailsFast covers the operator
-// misconfiguration where --client-cert and --identity-key are
-// drawn from different keypairs: tls.X509KeyPair rejects, and the
-// caller bubbles a clear error rather than booting a useless agent
-// that will fail every TLS handshake.
+// misconfiguration where --client-cert and the in-memory identity
+// key come from different keypairs: tls.X509KeyPair rejects, and
+// the caller bubbles a clear error rather than booting a useless
+// agent that will fail every TLS handshake.
 func TestBuildTLSConfig_KeyMismatchFailsFast(t *testing.T) {
 	dir := t.TempDir()
 	pubA, privA, _ := ed25519.GenerateKey(rand.Reader)
 	_, privB, _ := ed25519.GenerateKey(rand.Reader)
-	// Cert is for pubA, but the agent's "identity key" is privB.
 	certPath := writeSelfSignedCert(t, dir, "agent-01", pubA, privA)
-	keyPath := writeIdentityKey(t, dir, privB)
 
-	_, err := buildTLSConfig(certPath, keyPath, false)
+	_, err := buildTLSConfig(certPath, privB, false)
 	if err == nil {
 		t.Fatal("buildTLSConfig: expected error on cert/key mismatch")
 	}
@@ -99,8 +122,21 @@ func TestBuildTLSConfig_KeyMismatchFailsFast(t *testing.T) {
 // returning a silently empty config that would later mystery-fail at
 // dial time.
 func TestBuildTLSConfig_MissingCertFile(t *testing.T) {
-	if _, err := buildTLSConfig("/does/not/exist.pem", "/also/missing", false); err == nil {
-		t.Fatal("buildTLSConfig: expected error on missing files")
+	_, priv, _ := ed25519.GenerateKey(rand.Reader)
+	if _, err := buildTLSConfig("/does/not/exist.pem", priv, false); err == nil {
+		t.Fatal("buildTLSConfig: expected error on missing cert file")
+	}
+}
+
+// TestBuildTLSConfig_NilKeyFailsFast: caller forgot to load the
+// identity. Should error rather than silently produce an empty
+// config that would mystery-fail at dial time.
+func TestBuildTLSConfig_NilKeyFailsFast(t *testing.T) {
+	dir := t.TempDir()
+	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
+	certPath := writeSelfSignedCert(t, dir, "agent-01", pub, priv)
+	if _, err := buildTLSConfig(certPath, nil, false); err == nil {
+		t.Fatal("buildTLSConfig: expected error when priv is nil")
 	}
 }
 
@@ -130,18 +166,3 @@ func writeSelfSignedCert(t *testing.T, dir, cn string, pub ed25519.PublicKey, pr
 	return path
 }
 
-// writeIdentityKey writes a PKCS8-PEM Ed25519 private key matching
-// what tunnelclient.LoadIdentity expects.
-func writeIdentityKey(t *testing.T, dir string, priv ed25519.PrivateKey) string {
-	t.Helper()
-	pkcs8, err := x509.MarshalPKCS8PrivateKey(priv)
-	if err != nil {
-		t.Fatal(err)
-	}
-	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: pkcs8})
-	path := filepath.Join(dir, "identity.key")
-	if err := os.WriteFile(path, pemBytes, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	return path
-}

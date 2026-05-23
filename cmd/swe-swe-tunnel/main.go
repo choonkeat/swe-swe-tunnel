@@ -6,7 +6,11 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/tls"
+	"crypto/x509"
+	"encoding/pem"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -89,7 +93,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	tlsCfg, err := buildTLSConfig(*clientCert, *identityKey, *insecure)
+	tlsCfg, err := buildTLSConfig(*clientCert, priv, *insecure)
 	if err != nil {
 		logger.Error("tls config", "err", err)
 		emitter.Emit(tunnelclient.EventFatal, tunnelclient.FatalData{
@@ -117,29 +121,41 @@ func main() {
 }
 
 // buildTLSConfig assembles the dial-side tls.Config from the
-// --client-cert + --identity-key + --insecure inputs. When
-// clientCert is set, the cert is paired with identityKey via
-// tls.X509KeyPair — i.e. the agent's existing identity.key doubles
-// as the TLS private key (RFC 8410, Ed25519 X.509). No
-// --client-key flag exists by design.
+// --client-cert path + the already-loaded identity private key +
+// --insecure. The cert is paired with priv via tls.X509KeyPair —
+// the agent's identity.key doubles as the TLS private key (RFC
+// 8410, Ed25519 X.509), so there is no --client-key flag.
 //
-// Returns (nil, nil) when neither mTLS nor --insecure was requested
-// — the dial uses Go's default tls.Config and the server's normal
-// cert is verified against the system trust store.
-func buildTLSConfig(clientCertPath, identityKeyPath string, insecure bool) (*tls.Config, error) {
+// Taking priv as an in-memory ed25519.PrivateKey (rather than a
+// disk path) is load-bearing: tunnelclient.LoadIdentity may have
+// resolved the identity from SWE_TUNNEL_IDENTITY_KEY env, in
+// which case no file exists at --identity-key. Reading that path
+// would fail with "no such file or directory" and the agent
+// would refuse to boot even when its identity was already in
+// memory.
+//
+// Returns (nil, nil) when neither mTLS nor --insecure was
+// requested — the dial uses Go's default tls.Config and the
+// server's normal cert is verified against the system trust
+// store.
+func buildTLSConfig(clientCertPath string, priv ed25519.PrivateKey, insecure bool) (*tls.Config, error) {
 	if clientCertPath == "" && !insecure {
 		return nil, nil
 	}
 	cfg := &tls.Config{MinVersion: tls.VersionTLS12}
 	if clientCertPath != "" {
+		if priv == nil {
+			return nil, errors.New("identity private key is nil; load identity before buildTLSConfig")
+		}
 		certPEM, err := os.ReadFile(clientCertPath)
 		if err != nil {
 			return nil, fmt.Errorf("read --client-cert %s: %w", clientCertPath, err)
 		}
-		keyPEM, err := os.ReadFile(identityKeyPath)
+		pkcs8, err := x509.MarshalPKCS8PrivateKey(priv)
 		if err != nil {
-			return nil, fmt.Errorf("read --identity-key %s: %w", identityKeyPath, err)
+			return nil, fmt.Errorf("marshal identity key: %w", err)
 		}
+		keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: pkcs8})
 		cert, err := tls.X509KeyPair(certPEM, keyPEM)
 		if err != nil {
 			return nil, fmt.Errorf("pair cert+key: %w", err)
