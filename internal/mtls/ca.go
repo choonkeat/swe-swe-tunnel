@@ -11,7 +11,10 @@
 package mtls
 
 import (
+	"crypto"
+	"crypto/ecdsa"
 	"crypto/ed25519"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -175,16 +178,26 @@ type ClientBundle struct {
 	Passphrase string
 }
 
-// IssueClientCert mints a fresh Ed25519 keypair, signs a client cert
-// (CN=cn) for it against the loaded CA, and returns the cert + key as
-// PEM along with a PKCS#12 bundle protected by a generated passphrase.
-// Used by `swe-swe-tunneld mtls-issue` for browser users.
+// IssueClientCert mints a fresh ECDSA P-256 keypair, signs a client
+// cert (CN=cn) for it against the loaded CA, and returns the cert +
+// key as PEM along with a PKCS#12 bundle protected by a generated
+// passphrase. Used by `swe-swe-tunneld mtls-issue` for browser
+// users.
+//
+// ECDSA P-256 (not Ed25519) is intentional: macOS and iOS Keychain
+// refuse to decode an Ed25519 PKCS#12 with "Unable to decode the
+// provided data" — a documented Apple-side limitation that
+// surfaced live on 2026-05-23 trying to import a v1 (Ed25519)
+// bundle. P-256 is universally supported across browsers and
+// remains a sensible security floor (~128-bit equivalent). The CA
+// itself stays Ed25519 (cross-algorithm chains are normal X.509);
+// existing agent-side certs from SignClientPubkey are unaffected.
 func (c *CA) IssueClientCert(cn string, validFor time.Duration) (*ClientBundle, error) {
-	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, fmt.Errorf("generate client key: %w", err)
 	}
-	certPEM, err := c.signPub(cn, pub, validFor)
+	certPEM, err := c.signPub(cn, &priv.PublicKey, validFor)
 	if err != nil {
 		return nil, err
 	}
@@ -218,7 +231,13 @@ func (c *CA) SignClientPubkey(cn string, pub ed25519.PublicKey, validFor time.Du
 	return c.signPub(cn, pub, validFor)
 }
 
-func (c *CA) signPub(cn string, pub ed25519.PublicKey, validFor time.Duration) ([]byte, error) {
+// signPub creates the cert DER for whichever leaf public key the
+// caller passes — Ed25519 (agent flow via SignClientPubkey) or
+// ECDSA P-256 (browser flow via IssueClientCert). x509.CreateCertificate
+// accepts any supported public-key type via the empty interface,
+// so the function stays algorithm-agnostic for the leaf while the
+// CA's signing key (c.key) remains Ed25519.
+func (c *CA) signPub(cn string, pub crypto.PublicKey, validFor time.Duration) ([]byte, error) {
 	serial, err := randomSerial()
 	if err != nil {
 		return nil, err

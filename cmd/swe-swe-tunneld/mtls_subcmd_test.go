@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/x509"
@@ -126,8 +127,8 @@ func TestMtlsIssue_RoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("p12 decode with printed passphrase: %v", err)
 	}
-	if _, ok := priv.(ed25519.PrivateKey); !ok {
-		t.Errorf("p12 priv key type = %T, want ed25519.PrivateKey", priv)
+	if _, ok := priv.(*ecdsa.PrivateKey); !ok {
+		t.Errorf("p12 priv key type = %T, want *ecdsa.PrivateKey", priv)
 	}
 	if cert.Subject.CommonName != "alice" {
 		t.Errorf("p12 cert CN = %q, want %q", cert.Subject.CommonName, "alice")
