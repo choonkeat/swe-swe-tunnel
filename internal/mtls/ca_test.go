@@ -1,7 +1,9 @@
 package mtls
 
 import (
+	"crypto/ecdsa"
 	"crypto/ed25519"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/x509"
 	"encoding/pem"
@@ -183,9 +185,16 @@ func TestLoadCA_MissingFiles(t *testing.T) {
 // TestIssueClientCert_RoundTrip exercises the full server-side mint flow
 // used by `swe-swe-tunneld mtls-issue`. The returned bundle must:
 //   - contain non-empty CertPEM, KeyPEM, P12, Passphrase.
-//   - decode the p12 with the passphrase to recover the same Ed25519
+//   - decode the p12 with the passphrase to recover the same ECDSA P-256
 //     private key that's in KeyPEM.
 //   - produce a cert with the requested CN, signed by the CA in dir.
+//
+// ECDSA P-256 (not Ed25519) is intentional here: macOS / iOS Keychain
+// refuse to decode an Ed25519 PKCS#12 with "Unable to decode the
+// provided data" -- documented in the mTLS plan's Gotchas section.
+// The agent-side flow (SignClientPubkey) is separate and keeps
+// Ed25519 -- agents reuse their identity.key, which is Ed25519 by
+// design.
 func TestIssueClientCert_RoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	if err := InitCA(dir, false); err != nil {
@@ -252,15 +261,18 @@ func TestIssueClientCert_RoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse KeyPEM: %v", err)
 	}
-	pemEd, ok := rawPEMKey.(ed25519.PrivateKey)
+	pemECDSA, ok := rawPEMKey.(*ecdsa.PrivateKey)
 	if !ok {
-		t.Fatalf("KeyPEM = %T, want ed25519.PrivateKey", rawPEMKey)
+		t.Fatalf("KeyPEM = %T, want *ecdsa.PrivateKey", rawPEMKey)
 	}
-	p12Ed, ok := p12key.(ed25519.PrivateKey)
+	if pemECDSA.Curve != elliptic.P256() {
+		t.Fatalf("KeyPEM curve = %v, want P-256", pemECDSA.Curve)
+	}
+	p12ECDSA, ok := p12key.(*ecdsa.PrivateKey)
 	if !ok {
-		t.Fatalf("p12 key = %T, want ed25519.PrivateKey", p12key)
+		t.Fatalf("p12 key = %T, want *ecdsa.PrivateKey", p12key)
 	}
-	if !pemEd.Equal(p12Ed) {
+	if !pemECDSA.Equal(p12ECDSA) {
 		t.Fatal("KeyPEM and p12 key do not match")
 	}
 }
