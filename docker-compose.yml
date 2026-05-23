@@ -51,12 +51,13 @@ services:
       SWE_TUNNEL_ALLOWED_PORTS_FILE: ${SWE_TUNNEL_ALLOWED_PORTS_FILE:-}
     command:
       - --listen=:443
-      # mTLS: require every browser AND every agent to present a
-      # client cert signed by the CA at this path. The CA lives in
-      # the tunnel-data volume (minted via `swe-swe-tunneld
-      # mtls-init`). Reload SIGHUP-able; toggling on/off needs a
-      # restart. See docs/mtls.md.
-      - --mtls-ca=/var/lib/swe-swe-tunnel/mtls/ca.pem
+      # mTLS: uncomment to require every browser AND every agent
+      # to present a client cert signed by the CA at this path.
+      # The CA lives in the tunnel-data volume (mint via
+      # `docker compose run --rm swe-swe-tunneld mtls-init`).
+      # Reload SIGHUP-able; toggling on/off needs a container
+      # recreate. See docs/mtls.md.
+      # - --mtls-ca=/var/lib/swe-swe-tunnel/mtls/ca.pem
 
 volumes:
   tunnel-data:
