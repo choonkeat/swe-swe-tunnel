@@ -17,6 +17,70 @@ The flag and its accompanying toolkit cover three deployment patterns:
 Cases (1) and (2) use the built-in CA toolkit below. Case (3) brings its
 own CA bundle and points `--mtls-ca` at it.
 
+## Known limitations
+
+### TLS-intercepting middleboxes
+
+mTLS at the daemon is incompatible with any network path that terminates
+TLS at an intermediary and re-originates the connection to the daemon.
+The intermediary doesn't have the client's private key, so the
+re-originated connection arrives at the daemon with no client cert and
+the `RequireAndVerifyClientCert` policy rejects it. This isn't specific
+to swe-swe-tunneld — it's intrinsic to mutual TLS over any kind of
+HTTPS inspection.
+
+Common cases:
+
+* "SSL inspection" or "HTTPS inspection" appliances and proxies.
+* VPN clients that do TLS interception (some commercial / managed VPN
+  products do this; consumer VPNs usually don't).
+* DLP / endpoint-security tools that proxy outbound HTTPS through a
+  local agent.
+
+Symptoms: the browser shows a generic 502 / "bad gateway" page styled
+by the intermediary (not by our daemon), and the daemon log shows
+`tls: client didn't provide a certificate` for connections from the
+intermediary's IP. There's no daemon-side fix.
+
+If you need a host to bypass mTLS, options are: route that host's
+traffic around the intermediary (split-tunnel by hostname), or run a
+second daemon without `--mtls-ca` on a separate hostname.
+
+### Apple Keychain / iOS profile installer
+
+Apple's PKCS#12 import path is pickier than the format spec allows.
+`IssueClientCert` produces `.p12` files that work because it matches
+what `openssl pkcs12 -export -legacy` emits. The four constraints
+baked into `internal/mtls/ca.go`:
+
+* **MAC**: HMAC-SHA-1 with iterations ≥ 2048. The PKCS#12 default
+  `macIterations=1` (which most encoders use) is rejected with
+  `OSStatus -26276` ("PKCS#12 verify failure").
+* **Cert bag encryption**: `pbeWithSHAAnd40BitRC2-CBC` (RC2-40).
+  3DES for the cert bag is rejected even when the leaf cert is
+  otherwise acceptable. RC2-40 is weak, but it's protecting only
+  the public cert bag — the private-key bag stays 3DES.
+* **Key bag encryption**: `pbeWithSHAAnd3-KeyTripleDES-CBC` (3DES).
+* **Chain certs**: omit. Apple's pre-flight refuses the entire
+  bundle if any cert in the bundled chain has an Ed25519 signature
+  (OID `1.3.101.112`). Our internal CA is Ed25519-signed, so we
+  don't bundle the CA in the `.p12` — the browser only needs the
+  leaf to present during the TLS handshake, and the daemon already
+  has the CA via `--mtls-ca`.
+* **Leaf key algorithm**: ECDSA P-256. Ed25519 leaves are rejected
+  with "Unable to decode the provided data" on older macOS / iOS,
+  inconsistently on newer.
+
+The agent flow (`SignClientPubkey`, `mtls-sign`) is NOT affected by
+any of this — agents reuse their Ed25519 `identity.key` and the
+signed `.crt` is delivered as a raw PEM, never wrapped in PKCS#12.
+
+iOS displays imported certs with the generic label "Identity
+Certificate" because go-pkcs12's `Encode` doesn't expose the
+`friendlyName` bag attribute. Workaround: rename the profile after
+import via Settings → General → VPN & Device Management → tap the
+profile → Edit name.
+
 ## Quick start (built-in CA)
 
 ```sh

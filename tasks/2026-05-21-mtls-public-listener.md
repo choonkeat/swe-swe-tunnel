@@ -2,28 +2,38 @@
 
 ## Status
 
-Phase 1 shipped 2026-05-23. Four commits on `main`:
+Phase 1 landed. Surface in the codebase:
 
-- `bc5de47 mtls: add Ed25519 CA + client-cert toolkit` (the
-  `internal/mtls` package + unit tests).
-- `254bc9a swe-swe-tunneld: --mtls-ca enables mTLS on the public
-  listener` (daemon flag, TLS config + `GetConfigForClient`-based
-  SIGHUP-reloadable CA pool, `injectClientIdentityHeaders` in
-  `route()`, defence-in-depth peer-cert-pubkey vs Register-pubkey
-  check in `handleRegister`, e2e tests).
-- `006cc1a swe-swe-tunneld: mtls-init / mtls-issue / mtls-sign
-  subcommands` (built-in CA toolkit dispatched before flag.Parse;
-  pubkey file accepts both SPKI PEM and base64-RawStd).
-- _commit 4_: agent CLI `--client-cert`, `isPermanentTLSError`
-  classifier in the supervisor, `docs/mtls.md` + configuration
-  table rows + README link.
+- `internal/mtls/` — Ed25519 CA + client-cert toolkit
+  (`InitCA` / `LoadCA` / `IssueClientCert` /
+  `SignClientPubkey` / `LoadCABundle`) plus unit tests.
+- `cmd/swe-swe-tunneld/` — `--mtls-ca` flag, SIGHUP-reloadable
+  CA pool via `tls.Config.GetConfigForClient`,
+  `injectClientIdentityHeaders` in `route()`,
+  peer-cert-pubkey-vs-Register-pubkey defence-in-depth check in
+  `handleRegister`, three subcommands (`mtls-init`,
+  `mtls-issue`, `mtls-sign`).
+- `cmd/swe-swe-tunnel/` — `--client-cert` flag (paired against
+  the in-memory `identity.key`).
+- `internal/tunnelclient/` — `isPermanentTLSError` classifier
+  wired into the supervisor's retry policy.
+- `docs/mtls.md` — operator workflow, known limitations
+  (TLS-intercepting middleboxes, Apple Keychain quirks),
+  pubkey file formats, revocation roadmap.
+- `.claude/commands/generate-mtls-{p12-for-device,crt-for-client}.md`
+  — operator-facing slash commands that stage artifacts under
+  `./generated/`.
 
-Phase 2 (fingerprint denylist for revocation) is unstarted — see
-"Out of scope" below.
+The `IssueClientCert` algorithm choices (ECDSA P-256 leaf,
+LegacyRC2 PKCS#12 encoder with `WithIterations(2048)`, no CA
+bundled in the chain) are dictated by Apple Keychain's PKCS#12
+parser — see `docs/mtls.md` "Known limitations".
 
-Original planned 2026-05-21. Companion design discussion captured
-at `docs/research/mtls-design.html` (open with
-`npx @choonkeat/md-serve` and visit
+Phase 2 (fingerprint denylist for revocation) is unstarted —
+see "Out of scope" below.
+
+Companion design discussion at `docs/research/mtls-design.html`
+(open with `npx @choonkeat/md-serve` and visit
 `/docs/research/mtls-design.html` for the rendered mermaid
 sequence diagrams).
 
