@@ -216,7 +216,16 @@ func (c *CA) IssueClientCert(cn string, validFor time.Duration) (*ClientBundle, 
 	if err != nil {
 		return nil, fmt.Errorf("re-parse issued cert: %w", err)
 	}
-	p12, err := pkcs12.Modern.Encode(priv, cert, []*x509.Certificate{c.cert}, passphrase)
+	// LegacyDES (SHA-1 MAC + 3DES-CBC) is universally supported by
+	// Apple Keychain and iOS profile installer; Modern2023's stronger
+	// HMAC-SHA-256 + AES-256-CBC combo is rejected with "Unable to
+	// decode the provided data" on macOS and surfaced as "password
+	// incorrect" on iOS (verified live 2026-05-23). The weaker
+	// algorithms are acceptable here because the passphrase is
+	// high-entropy (18 chars over a 56-char alphabet, ~104 bits) and
+	// the .p12 is an ephemeral transport artifact — operators delete
+	// both p12 and passphrase as soon as the target device imports.
+	p12, err := pkcs12.LegacyDES.Encode(priv, cert, []*x509.Certificate{c.cert}, passphrase)
 	if err != nil {
 		return nil, fmt.Errorf("encode pkcs12: %w", err)
 	}
