@@ -6,7 +6,9 @@ You are minting a fresh **browser-user** mTLS bundle from the live
 production CA in the swe-swe-tunneld container. The output is a
 `.p12` (cert + freshly-minted private key, passphrase-protected) and
 a sidecar `.txt` holding the passphrase. Both land under
-`./generated/` (which is gitignored).
+`./generated/` (which is gitignored) **in this dev container**, where
+the operator can fetch them via the dev container's normal file
+download path (the same way they fetched the earlier `alice.crt`).
 
 This is a sensitive action — the .p12 contains a private key. The
 passphrase .txt is only useful at import time; the user is expected
@@ -15,9 +17,9 @@ to delete BOTH files after importing on the target device.
 # Run
 
 Work from the repo root: `/repos/swe-swe-tunnel/workspace`. Do
-everything via the Bash tool. Report progress with `send_progress`
-between steps and a final `send_message` with the on-host paths so
-the operator can `scp` them off.
+everything via the Bash and Write tools. Report progress with
+`send_progress` between steps and a final `send_message` with the
+dev-container paths so the operator can fetch them.
 
 ## Inputs
 
@@ -44,9 +46,10 @@ Run in parallel:
    volume). If not, refuse and tell the operator to run
    `docker compose run --rm swe-swe-tunneld mtls-init` first.
 
-3. Confirm `<cn>` won't clobber an existing artifact:
+3. Confirm `<cn>` won't clobber an existing artifact in the dev
+   container:
    ```sh
-   docker run --rm -v /repos/swe-swe-tunnel/workspace/generated:/g alpine ls /g/{cn}.p12 /g/{cn}.txt 2>/dev/null
+   ls generated/<cn>.p12 generated/<cn>.txt 2>/dev/null
    ```
    Empty output = clean; any hit = existing files. If anything
    exists, ask the user whether to overwrite. Don't silently
@@ -58,9 +61,8 @@ Run in parallel:
 Before generating, `send_message` summarizing:
 
 - the CN that will appear on the cert,
-- the on-host paths the artifacts will land at
-  (`/repos/swe-swe-tunnel/workspace/generated/<cn>.p12`,
-  `.../generated/<cn>.txt`),
+- the dev-container paths the artifacts will land at
+  (`./generated/<cn>.p12`, `./generated/<cn>.txt`),
 - a reminder: the passphrase is stdout-only at mint time — never
   recoverable later — the .txt file is the operator's single
   capture of it.
@@ -74,7 +76,8 @@ After confirmation:
 1. `send_progress`: "minting {cn}.p12 from the production CA…"
 
 2. Mint the bundle inside a `docker compose run --rm` ephemeral
-   container so the daemon doesn't pause:
+   container so the daemon doesn't pause. The .p12 lands in the
+   `tunnel-data` volume; the passphrase prints to stdout:
    ```sh
    docker compose run --rm swe-swe-tunneld \
      mtls-issue --cn "<cn>" \
@@ -86,54 +89,45 @@ After confirmation:
      If no `passphrase: ` line is present, abort with an error
      (mtls-issue contract was violated).
 
-3. Make sure `./generated/` exists on the HOST (NOT just in this
-   dev container — Write goes to the dev container only, and the
-   operator needs the file scp-able from the host):
+3. Make sure `./generated/` exists in the dev container:
    ```sh
-   docker run --rm -v /repos/swe-swe-tunnel/workspace:/repo alpine \
-     sh -c 'mkdir -p /repo/generated'
+   mkdir -p generated
    ```
 
-4. Copy the .p12 out of the `tunnel-data` volume into the host's
-   `./generated/`:
+4. Copy the .p12 out of the `tunnel-data` volume into the dev
+   container's `./generated/`. `docker cp` interprets the
+   destination path relative to THIS shell — i.e. the dev
+   container's filesystem — which is exactly where we want it:
    ```sh
-   docker run --rm \
-     -v /repos/swe-swe-tunnel/workspace/generated:/dst \
-     --volumes-from swe-swe-tunneld:ro \
-     alpine sh -c 'cp /var/lib/swe-swe-tunnel/mtls/<cn>.p12 /dst/<cn>.p12'
+   docker cp swe-swe-tunneld:/var/lib/swe-swe-tunnel/mtls/<cn>.p12 \
+     generated/<cn>.p12
    ```
-   `--volumes-from swe-swe-tunneld:ro` mounts the daemon's volumes
-   (read-only) so the source path is reachable. Mount `./generated/`
-   as `/dst` writable.
 
-5. Write the passphrase to `./generated/<cn>.txt` on the host:
-   ```sh
-   printf '%s\n' "<passphrase>" | docker run --rm -i \
-     -v /repos/swe-swe-tunnel/workspace/generated:/dst alpine \
-     sh -c 'cat > /dst/<cn>.txt'
-   ```
-   Stdout the passphrase via stdin so it never sits in shell
-   history or in process args.
+5. Write the passphrase to `./generated/<cn>.txt` via the Write
+   tool, with content = the passphrase + one trailing newline.
+   The Write goes to the dev container's filesystem at the
+   absolute path `/repos/swe-swe-tunnel/workspace/generated/<cn>.txt`.
 
-6. (Optional but recommended) **Delete the .p12 from the daemon's
-   volume** so the secret doesn't accumulate in production state:
+6. **Delete the .p12 from the daemon's volume** so the secret
+   doesn't accumulate in production state:
    ```sh
    docker exec swe-swe-tunneld rm /var/lib/swe-swe-tunnel/mtls/<cn>.p12
    ```
-   The cert is also reproducible — operator can re-issue from the
-   CA whenever needed. Leaving the .p12 in the volume forever is a
+   The cert is reproducible — operator can re-issue from the CA
+   whenever needed. Leaving the .p12 in the volume is a
    loose-secret risk.
 
 ## Report
 
 Final `send_message`:
 
-- on-host paths: `/repos/swe-swe-tunnel/workspace/generated/<cn>.p12`
-  and `.../<cn>.txt`,
-- size of each (use `ls -la`),
-- the SHA-256 fingerprint of the cert inside the .p12 (extract on
-  the host via `openssl pkcs12 -in <path> -nokeys -passin file:<txt>
-  -info 2>/dev/null` if openssl is available; skip silently if not),
+- dev-container paths: `./generated/<cn>.p12` and `./generated/<cn>.txt`,
+- size of each (use `ls -la generated/`),
+- the SHA-256 fingerprint of the cert inside the .p12 if openssl
+  is available in the dev container (`openssl pkcs12 -in
+  generated/<cn>.p12 -nokeys -passin "file:generated/<cn>.txt" -info
+  2>/dev/null` — skip silently if openssl absent or the call
+  fails),
 - **the post-import cleanup instructions**, verbatim:
 
   > After importing on the target device, delete both files:
@@ -147,9 +141,6 @@ Final `send_message`:
 ## Coding rules
 
 - Never echo the passphrase into a log line or a structured log.
-- Never write the passphrase via the `Write` tool — go through the
-  stdin-piped transient alpine, so the value never traverses the
-  tool boundary.
 - Never `rm` `./generated/` wholesale. Per-file cleanup is the
   operator's call.
 - If any step fails partway, leave both files in place if any

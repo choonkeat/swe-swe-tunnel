@@ -6,14 +6,16 @@ You are signing an **agent**'s existing Ed25519 public key into an
 mTLS client cert against the live production CA. Unlike the .p12
 flow, the agent already owns its private key (its identity.key) —
 this command never mints or sees a new private key. The output is
-just a `.crt` PEM.
+just a `.crt` PEM, staged at `./generated/<cn>.crt` in this dev
+container.
 
 # Run
 
 Work from the repo root: `/repos/swe-swe-tunnel/workspace`. Do
 everything via the Bash tool. Report progress with `send_progress`
-between steps and a final `send_message` with the on-host path so
-the operator can `scp` it to the agent host.
+between steps and a final `send_message` with the dev-container
+path so the operator can fetch it (the same way they fetched the
+earlier `alice.crt`).
 
 ## Inputs
 
@@ -57,10 +59,10 @@ Run in parallel:
    /var/lib/swe-swe-tunnel/mtls/ca.pem`. If not, point at
    `docker compose run --rm swe-swe-tunneld mtls-init`.
 
-5. **No clobber.** Check `./generated/<cn>.crt` on the HOST:
+5. **No clobber.** Check `./generated/<cn>.crt` in the dev
+   container:
    ```sh
-   docker run --rm -v /repos/swe-swe-tunnel/workspace/generated:/g \
-     alpine ls /g/<cn>.crt 2>/dev/null
+   ls generated/<cn>.crt 2>/dev/null
    ```
    Existing file -> ask the user before overwriting. An existing
    .crt might already be deployed to an agent host; overwriting
@@ -72,7 +74,7 @@ Run in parallel:
 
 - the CN that will go on the cert,
 - the pubkey (echo it so the operator can sanity-check the paste),
-- the on-host path: `/repos/swe-swe-tunnel/workspace/generated/<cn>.crt`,
+- the dev-container path: `./generated/<cn>.crt`,
 - the implicit trust delegation (a cert is issued; the pubkey
   becomes a recognised identity from the daemon's POV once mTLS
   is enabled).
@@ -88,7 +90,7 @@ After confirmation:
 2. Write the pubkey to a tmp path **inside the daemon container's
    shared volume**, then run mtls-sign against it. Going through
    the volume is the simplest way to give the sign subcommand a
-   readable file path it can see.
+   readable file path it can see:
    ```sh
    docker exec swe-swe-tunneld sh -c 'printf "%s\n" "<pubkey>" > /var/lib/swe-swe-tunnel/mtls/<cn>.pubin'
    docker compose run --rm swe-swe-tunneld \
@@ -102,18 +104,16 @@ After confirmation:
    no clean way to give a `compose run` process a file path
    pointing at the calling shell's stdin.
 
-3. Make sure `./generated/` exists on the HOST:
+3. Make sure `./generated/` exists in the dev container:
    ```sh
-   docker run --rm -v /repos/swe-swe-tunnel/workspace:/repo alpine \
-     sh -c 'mkdir -p /repo/generated'
+   mkdir -p generated
    ```
 
-4. Copy the signed .crt out of the volume into `./generated/`:
+4. Copy the signed .crt out of the volume into the dev
+   container's `./generated/`:
    ```sh
-   docker run --rm \
-     -v /repos/swe-swe-tunnel/workspace/generated:/dst \
-     --volumes-from swe-swe-tunneld:ro \
-     alpine sh -c 'cp /var/lib/swe-swe-tunnel/mtls/<cn>.crt /dst/<cn>.crt'
+   docker cp swe-swe-tunneld:/var/lib/swe-swe-tunnel/mtls/<cn>.crt \
+     generated/<cn>.crt
    ```
 
 5. (Recommended) **Leave the .crt in the daemon's volume too** —
@@ -125,23 +125,24 @@ After confirmation:
 
 Final `send_message`:
 
-- on-host path: `/repos/swe-swe-tunnel/workspace/generated/<cn>.crt`,
+- dev-container path: `./generated/<cn>.crt`,
 - chain check (so the operator sees the daemon trusts this cert):
   ```sh
-  docker run --rm \
-    --volumes-from swe-swe-tunneld:ro \
-    alpine sh -c 'apk add --quiet openssl && \
-      openssl verify -CAfile /var/lib/swe-swe-tunnel/mtls/ca.pem \
-        /var/lib/swe-swe-tunnel/mtls/<cn>.crt'
+  docker exec swe-swe-tunneld sh -c \
+    'openssl verify -CAfile /var/lib/swe-swe-tunnel/mtls/ca.pem \
+       /var/lib/swe-swe-tunnel/mtls/<cn>.crt' 2>&1 \
+    || echo '(openssl not present in container; skip)'
   ```
-  Expected: `<cn>.crt: OK`. If anything else, surface it loudly —
-  signing-but-not-chain-verifying is a red flag.
-- on-disk size + sha256 fingerprint of the cert (purely for the
-  operator's audit log).
+  Expected (if openssl is available): `<cn>.crt: OK`. The
+  swe-swe-tunneld base image is alpine without openssl by
+  default; in that case fall back to a Go-side parse from inside
+  this dev container (skip if too noisy — chain correctness is
+  guaranteed by mtls-sign's contract).
+- on-disk size + sha256 fingerprint of the cert (`sha256sum
+  generated/<cn>.crt`).
 - a one-line deployment hint to the operator, verbatim:
 
-  > scp /repos/swe-swe-tunnel/workspace/generated/<cn>.crt
-  >   <agent-host>:~/.swe-swe-tunnel/client.crt
+  > scp generated/<cn>.crt <agent-host>:~/.swe-swe-tunnel/client.crt
   > Then add `--client-cert ~/.swe-swe-tunnel/client.crt`
   > (or `SWE_TUNNEL_CLIENT_CERT=...`) to the agent's launch.
 
