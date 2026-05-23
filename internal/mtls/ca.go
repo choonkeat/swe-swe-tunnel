@@ -216,16 +216,27 @@ func (c *CA) IssueClientCert(cn string, validFor time.Duration) (*ClientBundle, 
 	if err != nil {
 		return nil, fmt.Errorf("re-parse issued cert: %w", err)
 	}
-	// LegacyDES (SHA-1 MAC + 3DES-CBC) is universally supported by
-	// Apple Keychain and iOS profile installer; Modern2023's stronger
+	// LegacyDES (SHA-1 MAC + 3DES-CBC) is the algorithm combo Apple
+	// Keychain and iOS profile installer accept; Modern2023's
 	// HMAC-SHA-256 + AES-256-CBC combo is rejected with "Unable to
-	// decode the provided data" on macOS and surfaced as "password
-	// incorrect" on iOS (verified live 2026-05-23). The weaker
-	// algorithms are acceptable here because the passphrase is
-	// high-entropy (18 chars over a 56-char alphabet, ~104 bits) and
-	// the .p12 is an ephemeral transport artifact — operators delete
-	// both p12 and passphrase as soon as the target device imports.
-	p12, err := pkcs12.LegacyDES.Encode(priv, cert, []*x509.Certificate{c.cert}, passphrase)
+	// decode the provided data" on macOS (verified live 2026-05-23).
+	//
+	// `WithIterations(2048)` is load-bearing: the stock LegacyDES
+	// encoder uses macIterations=1, which macOS Keychain rejects
+	// with OSStatus -26276 ("PKCS#12 verify failure") because the
+	// MAC iteration count is below its minimum threshold.
+	// `openssl pkcs12 -export -legacy` produces files with
+	// macIterations=2048 by default for exactly this reason.
+	// WithIterations sets BOTH macIterations and
+	// encryptionIterations to the value (encryption was already
+	// 2048 in stock LegacyDES; this only changes MAC iter).
+	//
+	// The weaker outer-container algorithms are acceptable here
+	// because the passphrase is high-entropy (18 chars over a
+	// 56-char alphabet, ~104 bits) and the .p12 is an ephemeral
+	// transport artifact — operators delete both .p12 and
+	// passphrase as soon as the target device imports.
+	p12, err := pkcs12.LegacyDES.WithIterations(2048).Encode(priv, cert, []*x509.Certificate{c.cert}, passphrase)
 	if err != nil {
 		return nil, fmt.Errorf("encode pkcs12: %w", err)
 	}
