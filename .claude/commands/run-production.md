@@ -98,12 +98,18 @@ docker run --rm \
   alpine sh -c 'cd / && tar -czf - var/lib/swe-swe-tunnel etc/swe-swe-tunneld/allowlist' \
   > "$out"
 
-# Append host-side .env (if present). gzip doesn't support
-# tar -A in-place; decompress, append, recompress. Archive is
-# small (~30 KB); this is cheap.
-if [ -f .env ]; then
+# Append host-side config that lives outside the volume: .env and
+# the per-host Compose override (docker-compose.override.yml, which
+# holds the cert-less register port + its env). Both are gitignored,
+# so this snapshot is their only backup. gzip can't append in place;
+# decompress, append, recompress once. Archive is small (~30 KB).
+host_files=""
+for f in .env docker-compose.override.yml; do
+  [ -f "$f" ] && host_files="$host_files $f"
+done
+if [ -n "$host_files" ]; then
   gunzip "$out"
-  tar -rf "${out%.gz}" .env
+  tar -rf "${out%.gz}" $host_files
   gzip "${out%.gz}"
 fi
 
@@ -133,9 +139,10 @@ docker run --rm -i \
   --volumes-from swe-swe-tunneld:rw \
   alpine sh -c 'cd / && tar -xzf -' \
   < backups/snapshot-XXX.tar.gz
-# If the snapshot bundled .env, restore it to the host repo
-# root separately:
-tar -xzf backups/snapshot-XXX.tar.gz .env
+# If the snapshot bundled host-side config, restore it to the repo
+# root separately (name only the members the snapshot actually
+# included — .env and/or docker-compose.override.yml):
+tar -xzf backups/snapshot-XXX.tar.gz .env docker-compose.override.yml
 docker compose up -d swe-swe-tunneld
 ```
 
