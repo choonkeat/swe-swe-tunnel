@@ -71,54 +71,71 @@ snapshot is the recovery path if the new image misbehaves.
 Default retention: most-recent 5 snapshots; older ones are
 deleted.
 
+The snapshot is **streamed** from a transient container into
+the calling shell's filesystem (via `> "$out"`), so it lands
+in the same path your shell sees as `./backups/` — matching
+how `/generate-mtls-p12-for-device` and
+`/generate-mtls-crt-for-client` already stage artifacts. This
+avoids the dev-container-vs-docker-host filesystem split:
+mounting `-v "$(pwd)/backups:/dst"` inside `docker run` would
+resolve `/dst` against the docker host's filesystem, not the
+calling shell's — leaving the file invisible from `ls
+backups/`.
+
 `send_progress`: "snapshotting before deploy…"
 
 ```sh
 mkdir -p backups
 ts=$(date -u +%Y%m%dT%H%M%SZ)
 out="backups/snapshot-${ts}.tar.gz"
-# Bundle the tunnel-data volume + bind-mounted allowlist + host
-# .env (if present) into one tar.gz. --volumes-from gives us
-# the container's read-only view of both the named volume and
-# the allowlist bind-mount; -v "$(pwd):/host:ro" adds the
-# host-only .env into the same alpine container.
+# Stream the daemon's tunnel-data volume + bind-mounted
+# allowlist out via a transient alpine container.
+# --volumes-from gives us the container's read-only view of
+# both. The redirect lands the file in the calling shell's
+# filesystem.
 docker run --rm \
   --volumes-from swe-swe-tunneld:ro \
-  -v "$(pwd):/host:ro" \
-  -v "$(pwd)/backups:/dst" \
-  alpine sh -c '
-    set -e
-    cd /
-    paths="var/lib/swe-swe-tunnel etc/swe-swe-tunneld/allowlist"
-    env_arg=""
-    [ -f /host/.env ] && env_arg="-C /host .env"
-    tar -czf /dst/snapshot-'"${ts}"'.tar.gz $paths $env_arg
-  '
+  alpine sh -c 'cd / && tar -czf - var/lib/swe-swe-tunnel etc/swe-swe-tunneld/allowlist' \
+  > "$out"
+
+# Append host-side .env (if present). gzip doesn't support
+# tar -A in-place; decompress, append, recompress. Archive is
+# small (~30 KB); this is cheap.
+if [ -f .env ]; then
+  gunzip "$out"
+  tar -rf "${out%.gz}" .env
+  gzip "${out%.gz}"
+fi
+
 # Retention: keep most-recent 5.
 ls -t backups/snapshot-*.tar.gz 2>/dev/null | tail -n +6 | xargs -r rm
 ls -lh "$out"
 ```
 
-If the snapshot command fails (volume unreachable, disk full,
-container missing), **stop and report via `send_message`**.
-Don't proceed with a destructive rebuild that would orphan the
-prior state without a backup.
+If the `docker run` exits non-zero (volume unreachable,
+container missing) or the final `ls` fails (write didn't
+land), **stop and report via `send_message`**. Don't proceed
+with a destructive rebuild that would orphan the prior state
+without a backup.
 
-The snapshot path is included in the final report (step Report
-below) so the operator knows exactly which file to restore from
-if needed.
+The snapshot path is included in the final report (step
+Report below) so the operator knows exactly which file to
+restore from if needed.
 
-To restore: stop the service, untar in place from `/`, and
-restart. Concretely:
+To restore: stop the service, stream the tarball back into the
+volume via a transient container, restart. Concretely:
 
 ```sh
 docker compose stop swe-swe-tunneld
-docker run --rm \
+# Stream the snapshot IN via stdin to a transient container
+# that has rw access to the volume.
+docker run --rm -i \
   --volumes-from swe-swe-tunneld:rw \
-  -v "$(pwd)/backups:/src:ro" \
-  alpine sh -c 'cd / && tar -xzf /src/snapshot-XXX.tar.gz'
-# .env on the host: extract separately from the same tarball if needed:
-#   tar -xzf backups/snapshot-XXX.tar.gz .env
+  alpine sh -c 'cd / && tar -xzf -' \
+  < backups/snapshot-XXX.tar.gz
+# If the snapshot bundled .env, restore it to the host repo
+# root separately:
+tar -xzf backups/snapshot-XXX.tar.gz .env
 docker compose up -d swe-swe-tunneld
 ```
 
