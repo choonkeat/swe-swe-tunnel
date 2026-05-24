@@ -118,8 +118,20 @@ func main() {
 		// tls.Config.ClientAuth = RequireAndVerifyClientCert. Empty
 		// (the default) keeps today's behaviour. SIGHUP reloads the
 		// bundle in place; load failures keep the prior pool.
-		mtlsCA      = flag.String("mtls-ca", "", "PEM bundle of CAs to trust for client certs (enables mTLS on the public listener; SIGHUP-reloadable)")
-		showVersion = flag.Bool("version", false, "print version and exit")
+		mtlsCA = flag.String("mtls-ca", "", "PEM bundle of CAs to trust for client certs (enables mTLS on the public listener; SIGHUP-reloadable)")
+		// register-listen-without-mtls: an ADDITIONAL HTTPS listener
+		// that mounts only /v1/connect and does NOT require a client
+		// cert, so cert-less agents can register while browser access on
+		// the main listener stays mTLS-gated. Requires --mtls-ca (the
+		// main listener already accepts cert-less registration when mTLS
+		// is off, so the flag is meaningless without it) and
+		// --allowlist-dir (a cert-less registration port without an
+		// allowlist is open to the internet). The main listener keeps its
+		// own mTLS-gated /v1/connect — this is additive, not a
+		// replacement. SIGHUP reloads its CA pool too (used only for the
+		// opportunistic cert_key_mismatch binding; cert-less agents pass).
+		registerListenNoMTLS = flag.String("register-listen-without-mtls", "", "additional HTTPS listener that accepts /v1/connect WITHOUT a client cert (e.g. :8443); requires --mtls-ca and --allowlist-dir")
+		showVersion          = flag.Bool("version", false, "print version and exit")
 	)
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), "swe-swe-tunneld %s\n\n", version.String())
@@ -167,6 +179,9 @@ func main() {
 	if *mtlsCA == "" {
 		*mtlsCA = os.Getenv("SWE_TUNNEL_MTLS_CA")
 	}
+	if *registerListenNoMTLS == "" {
+		*registerListenNoMTLS = os.Getenv("SWE_TUNNEL_REGISTER_LISTEN_WITHOUT_MTLS")
+	}
 
 	if err := requireFlags(*apex, *email, *noAcme); err != nil {
 		flag.Usage()
@@ -178,6 +193,15 @@ func main() {
 	// "wins" — fail loudly rather than picking silently.
 	if *allowedPortsFile != "" && flagSet("allowed-ports") {
 		logger.Error("--allowed-ports and --allowed-ports-file are mutually exclusive")
+		os.Exit(2)
+	}
+
+	// The cert-less registration listener has two hard preconditions
+	// (see validateRegisterListen). Loud-fail on boot rather than start a
+	// listener that's either pointless (no mTLS) or open to the internet
+	// (no allowlist).
+	if err := validateRegisterListen(*registerListenNoMTLS, *mtlsCA, *allowlistDir); err != nil {
+		logger.Error(err.Error())
 		os.Exit(2)
 	}
 
@@ -411,11 +435,45 @@ func main() {
 		}
 	}()
 
+	// Optional cert-less registration listener. Mounts only
+	// /v1/connect (reusing the same connectHandler value, so it shares
+	// the registry, identity store, rate limiters and allowlist with
+	// the main listener) plus /healthz. No hello page, no proxy
+	// route() — the browser-facing proxy stays exclusively on the
+	// mTLS listener. validateRegisterListen above guarantees mtlsB is
+	// non-nil here.
+	var regSrv *http.Server
+	if *registerListenNoMTLS != "" {
+		regMux := http.NewServeMux()
+		regMux.Handle("/v1/connect", connectHandler(reg, idStore, certMgr, *apex, ipLim, keyLim, skewLim, allow, logger))
+		regMux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ok\n"))
+		})
+		regSrv = &http.Server{
+			Addr:              *registerListenNoMTLS,
+			Handler:           regMux,
+			TLSConfig:         registerTLSConfig(certMgr.GetCertificate, mtlsB),
+			ReadHeaderTimeout: 10 * time.Second,
+			IdleTimeout:       2 * time.Minute,
+		}
+		logger.Info("register-without-mtls listening", "addr", *registerListenNoMTLS)
+		go func() {
+			if err := regSrv.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
+				logger.Error("register listener exited", "err", err)
+				stop()
+			}
+		}()
+	}
+
 	<-ctx.Done()
 	logger.Info("shutting down")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(shutdownCtx)
+	if regSrv != nil {
+		_ = regSrv.Shutdown(shutdownCtx)
+	}
 }
 
 func helloHandler(apex string) http.Handler {
@@ -532,6 +590,64 @@ func requireFlags(apex, email string, noAcme bool) error {
 		return fmt.Errorf("--acme-email is required when ACME is enabled (or SWE_TUNNEL_ACME_EMAIL); pass --no-acme to skip ACME entirely")
 	}
 	return nil
+}
+
+// validateRegisterListen enforces the preconditions for the cert-less
+// registration listener (--register-listen-without-mtls). When the
+// address is empty the listener is off and there's nothing to check.
+// When set it requires:
+//
+//   - --mtls-ca: without mTLS on the main listener, that listener
+//     already accepts cert-less registration, so a second cert-less
+//     port is meaningless (a misconfiguration to flag, not honour).
+//   - --allowlist-dir: a cert-less registration port without an
+//     allowlist is open registration reachable by anyone on the
+//     internet (rate-limited only). The allowlist is the gate that
+//     replaces mTLS here, so it must be present.
+//
+// Pure function so it can be unit-tested without spinning up main.
+func validateRegisterListen(registerAddr, mtlsCA, allowlistDir string) error {
+	if registerAddr == "" {
+		return nil
+	}
+	if mtlsCA == "" {
+		return fmt.Errorf("--register-listen-without-mtls requires --mtls-ca (the main listener already accepts cert-less registration when mTLS is off)")
+	}
+	if allowlistDir == "" {
+		return fmt.Errorf("--register-listen-without-mtls requires --allowlist-dir (a cert-less registration port without an allowlist is open to the internet)")
+	}
+	return nil
+}
+
+// registerTLSConfig builds the TLS config for the cert-less
+// registration listener. Unlike the main listener's
+// RequireAndVerifyClientCert, this uses VerifyClientCertIfGiven: a
+// cert-less agent completes the handshake (its register is gated by
+// the Ed25519 signature + allowlist in handleRegister), while a
+// cert-*bearing* agent must present one signed by --mtls-ca — and a
+// verified cert then populates r.TLS.PeerCertificates, flowing through
+// the cert_key_mismatch binding in handleRegister (opportunistic
+// defence-in-depth). RequestClientCert is deliberately NOT used: it
+// would populate an *unverified* peer cert, making that binding
+// forgeable.
+//
+// The CA pool is read per handshake via GetConfigForClient, so SIGHUP
+// CA reloads take effect on this listener too — same mechanism as the
+// main listener. bundle must be non-nil (the boot guard in
+// validateRegisterListen guarantees --mtls-ca is set).
+func registerTLSConfig(getCert func(*tls.ClientHelloInfo) (*tls.Certificate, error), bundle *mtlsBundle) *tls.Config {
+	return &tls.Config{
+		GetCertificate: getCert,
+		MinVersion:     tls.VersionTLS12,
+		GetConfigForClient: func(*tls.ClientHelloInfo) (*tls.Config, error) {
+			return &tls.Config{
+				GetCertificate: getCert,
+				MinVersion:     tls.VersionTLS12,
+				ClientCAs:      bundle.Pool(),
+				ClientAuth:     tls.VerifyClientCertIfGiven,
+			}, nil
+		},
+	}
 }
 
 // reloadCerts is a SIGHUP hook for the cert table. It rescans the

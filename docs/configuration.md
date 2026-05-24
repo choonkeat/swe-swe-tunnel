@@ -19,6 +19,7 @@ All flags can be set via env. Every env var is also a flag, and vice versa.
 | `--allowed-ports` | `SWE_TUNNEL_ALLOWED_PORTS` | `1977,3000-3099,4000-4099,5000-5099,5173,8000-8099,8080,8081,9898,20000-29999` | no | Inline destination-port allowlist; `all` disables the gate. Restart-only. |
 | `--allowed-ports-file` | `SWE_TUNNEL_ALLOWED_PORTS_FILE` | (off) | no | File path holding the port allowlist (multi-line + `#` comments OK). SIGHUP-reloadable. Mutually exclusive with the inline form. |
 | `--mtls-ca` | `SWE_TUNNEL_MTLS_CA` | (off) | no | PEM bundle of CAs trusted for client certs. Presence enables mTLS on the public listener (`ClientAuth=RequireAndVerifyClientCert`). SIGHUP-reloadable. See [`docs/mtls.md`](mtls.md). |
+| `--register-listen-without-mtls` | `SWE_TUNNEL_REGISTER_LISTEN_WITHOUT_MTLS` | (off) | no | Additional HTTPS listener (e.g. `:8443`) that accepts `/v1/connect` **without** a client cert, so cert-less agents can register while browser access on `--listen` stays mTLS-gated. Requires `--mtls-ca` **and** `--allowlist-dir`. The main listener keeps its own mTLS-gated registration — this is additive. See [`docs/mtls.md`](mtls.md). |
 
 DNS-provider credentials are read from the lego provider's standard env vars (e.g. `DNSIMPLE_OAUTH_TOKEN` for `dnsimple`, `CF_API_TOKEN` for cloudflare, etc.).
 

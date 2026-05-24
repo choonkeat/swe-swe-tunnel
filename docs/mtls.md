@@ -184,6 +184,56 @@ top of mTLS (see [`docs/access-control.md`](access-control.md)).
 Concretely: the agent must present a CA-signed cert *AND* the pubkey
 must appear in some allowlist file. Either gate alone refuses.
 
+## Cert-less agent registration (`--register-listen-without-mtls`)
+
+Turning `--mtls-ca` on locks every live agent out at the TLS layer
+until each one is re-deployed with `--client-cert` — which means
+minting, distributing, and installing a cert per agent host. When you
+want mTLS protecting **browser** access but don't want to issue a cert
+to every agent, run a second listener that accepts registration
+without one:
+
+```sh
+swe-swe-tunneld \
+  --mtls-ca {state-dir}/mtls/ca.pem \
+  --allowlist-dir /etc/swe-swe-tunnel/allowlist \
+  --register-listen-without-mtls :8443 \
+  ...
+```
+
+- The main listener (`--listen`, default `:443`) is **unchanged**:
+  `RequireAndVerifyClientCert` for both the browser proxy *and*
+  `/v1/connect`. Agents that hold a `--client-cert` keep using it.
+- The new listener mounts **only** `/v1/connect` (plus `/healthz`).
+  It does not serve the browser proxy, so there is no cert-less path
+  to the data plane. A cert-less agent points its `--server` at this
+  port: `--server https://tunnel.example.com:8443`.
+
+This is **additive** — it does not remove the ability to register over
+mTLS on `:443`. Agents with certs and agents without can run side by
+side; you choose per agent.
+
+### Why it's safe (and the two requirements)
+
+Agent registration is already strongly authenticated without mTLS:
+the Ed25519-signed Register frame, a ±5min replay window, per-IP and
+per-pubkey rate limits, a slow-loris timeout, and the `--allowlist-dir`
+gate. mTLS on the agent path is pure defence-in-depth. So the flag has
+two hard preconditions (boot fails loudly without them):
+
+* **`--mtls-ca` is required.** Without mTLS on the main listener, that
+  listener already accepts cert-less registration — a second cert-less
+  port would be meaningless.
+* **`--allowlist-dir` is required.** The allowlist is the gate that
+  replaces mTLS here. Without it, the register port is open
+  registration reachable by anyone on the internet (rate-limited only).
+
+The register listener uses `VerifyClientCertIfGiven`: a cert-less agent
+passes, but an agent that *does* present a cert must present one signed
+by `--mtls-ca`, and that verified cert still flows through the
+`cert_key_mismatch` binding above (opportunistic defence-in-depth). Its
+CA pool is SIGHUP-reloadable, same as the main listener's.
+
 ## SIGHUP reload
 
 `kill -HUP <pid>` re-reads the CA bundle from disk. The reload is
