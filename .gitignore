@@ -19,3 +19,10 @@
 # key under passphrase, .txt is the passphrase. Delete each file as
 # soon as the target device finishes import.
 /generated/
+
+# Pre-deploy snapshots produced by /run-production. Each snapshot
+# is a tar.gz of the tunnel-data volume + ./allowlist + .env, taken
+# just before a rebuild so a broken deploy is recoverable. Last 5
+# kept on disk by default. Sensitive (LE account key, CA private
+# key, DNS API token); never travel via the codebase.
+/backups/

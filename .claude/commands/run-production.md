@@ -63,6 +63,65 @@ If `git status` is dirty or HEAD is not on `main`, hold the destructive
 flags off the quick-reply list until the user resolves that — confirm
 the tree state first, then re-prompt with the flag options.
 
+## Snapshot
+
+After the user confirms but BEFORE any rebuild step, take a
+pre-deploy snapshot of operator state into `./backups/`. The
+snapshot is the recovery path if the new image misbehaves.
+Default retention: most-recent 5 snapshots; older ones are
+deleted.
+
+`send_progress`: "snapshotting before deploy…"
+
+```sh
+mkdir -p backups
+ts=$(date -u +%Y%m%dT%H%M%SZ)
+out="backups/snapshot-${ts}.tar.gz"
+# Bundle the tunnel-data volume + bind-mounted allowlist + host
+# .env (if present) into one tar.gz. --volumes-from gives us
+# the container's read-only view of both the named volume and
+# the allowlist bind-mount; -v "$(pwd):/host:ro" adds the
+# host-only .env into the same alpine container.
+docker run --rm \
+  --volumes-from swe-swe-tunneld:ro \
+  -v "$(pwd):/host:ro" \
+  -v "$(pwd)/backups:/dst" \
+  alpine sh -c '
+    set -e
+    cd /
+    paths="var/lib/swe-swe-tunnel etc/swe-swe-tunneld/allowlist"
+    env_arg=""
+    [ -f /host/.env ] && env_arg="-C /host .env"
+    tar -czf /dst/snapshot-'"${ts}"'.tar.gz $paths $env_arg
+  '
+# Retention: keep most-recent 5.
+ls -t backups/snapshot-*.tar.gz 2>/dev/null | tail -n +6 | xargs -r rm
+ls -lh "$out"
+```
+
+If the snapshot command fails (volume unreachable, disk full,
+container missing), **stop and report via `send_message`**.
+Don't proceed with a destructive rebuild that would orphan the
+prior state without a backup.
+
+The snapshot path is included in the final report (step Report
+below) so the operator knows exactly which file to restore from
+if needed.
+
+To restore: stop the service, untar in place from `/`, and
+restart. Concretely:
+
+```sh
+docker compose stop swe-swe-tunneld
+docker run --rm \
+  --volumes-from swe-swe-tunneld:rw \
+  -v "$(pwd)/backups:/src:ro" \
+  alpine sh -c 'cd / && tar -xzf /src/snapshot-XXX.tar.gz'
+# .env on the host: extract separately from the same tarball if needed:
+#   tar -xzf backups/snapshot-XXX.tar.gz .env
+docker compose up -d swe-swe-tunneld
+```
+
 ## Build + recreate
 
 After the user confirms, capture which flags they picked:
@@ -107,6 +166,7 @@ changed.
 
 Final `send_message` summarizes:
 
+- pre-deploy snapshot path (`backups/snapshot-TS.tar.gz`) + size,
 - new image id + created timestamp (from `docker image inspect`),
 - container status (uptime in seconds — or "unchanged" if no recreate),
 - whether the image id actually changed,
