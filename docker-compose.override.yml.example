@@ -1,0 +1,35 @@
+# Per-host Compose override — copy to docker-compose.override.yml (which
+# is gitignored) and edit. Compose auto-merges docker-compose.override.yml
+# onto docker-compose.yml with no extra flags: `ports` are appended,
+# `environment` keys are merged.
+#
+# This enables the cert-less agent registration listener
+# (--register-listen-without-mtls). The main :443 listener stays
+# mTLS-gated; this adds a second port that accepts /v1/connect WITHOUT a
+# client cert, gated instead by the allowlist + the Ed25519 Register
+# signature. See docs/mtls.md.
+#
+# SECURITY NOTES
+#  * Pick a HIGH, non-obvious port (avoid 8443/8080/9000 — scanners probe
+#    those). Hiding the port cuts opportunistic scan noise but is NOT a
+#    security boundary: the allowlist is what actually stops an attacker
+#    who finds the port.
+#  * Keeping this file out of the repo (it's gitignored) is the point —
+#    the real port number lives only here, on the host.
+#  * The daemon refuses to boot the register port without BOTH --mtls-ca
+#    and --allowlist-dir, so set them below (or in .env).
+
+services:
+  swe-swe-tunneld:
+    ports:
+      # Publish your chosen high port (host:container, same number).
+      - "54321:54321"
+    environment:
+      # The cert-less registration listener address (container-side).
+      SWE_TUNNEL_REGISTER_LISTEN_WITHOUT_MTLS: ":54321"
+      # Required preconditions for the register port. The CA lives in the
+      # tunnel-data volume (mint via `docker compose run --rm
+      # swe-swe-tunneld mtls-init`); the allowlist dir is bind-mounted by
+      # the base compose.
+      SWE_TUNNEL_MTLS_CA: /var/lib/swe-swe-tunnel/mtls/ca.pem
+      SWE_TUNNEL_ALLOWLIST_DIR: /etc/swe-swe-tunneld/allowlist

@@ -213,6 +213,15 @@ This is **additive** — it does not remove the ability to register over
 mTLS on `:443`. Agents with certs and agents without can run side by
 side; you choose per agent.
 
+The `:8443` above is just an illustration. Treat the actual port as
+per-deployment and keep it out of the repo: pick a high, non-obvious
+number (avoid 8443/8080/9000 — scanners probe those). With Compose,
+wire it via a gitignored `docker-compose.override.yml` (copy
+`docker-compose.override.yml.example`) so neither the port nor its
+publish mapping is public. Hiding the port cuts opportunistic scan
+noise but is **not** a security boundary — the allowlist below is what
+actually stops an attacker who finds the port.
+
 ### Why it's safe (and the two requirements)
 
 Agent registration is already strongly authenticated without mTLS:

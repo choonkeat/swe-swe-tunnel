@@ -5,6 +5,15 @@
 /swe-swe-tunneld
 .swe-swe/
 
+# Per-host Compose override. Compose auto-merges docker-compose.override.yml
+# onto the base. We keep it gitignored so the alternate cert-less
+# registration port (--register-listen-without-mtls) and its publish
+# mapping never travel via the public repo — port obscurity is a thin
+# defence-in-depth layer, not a lock (the allowlist + Ed25519 gate is).
+# Copy docker-compose.override.yml.example and fill in a high,
+# non-obvious port.
+docker-compose.override.yml
+
 # Allowlist contents are per-deployment operator config (Ed25519 pubkey
 # files for the Register gate). Public keys are not secret, but they are
 # host-local policy and should NOT travel via the codebase. Anyone who
