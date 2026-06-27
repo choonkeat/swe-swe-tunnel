@@ -3,11 +3,16 @@
 // the LoadCABundle helper the daemon calls at boot to populate
 // tls.Config.ClientCAs.
 //
-// Everything is Ed25519: the CA root, freshly issued client keypairs
-// (IssueClientCert), and signed-from-pubkey certs (SignClientPubkey). The
-// last is what lets an agent reuse its existing identity.key as the TLS
-// keypair — one private key, two uses, no new on-disk material on the
-// agent host.
+// Algorithms: the CA root signs with ECDSA P-256 (InitCA). An Ed25519 CA
+// signature is unusable by Apple (macOS/iOS) clients — Safari/Keychain
+// cannot evaluate the Ed25519 signature OID on the leaf, so the cert
+// imports but is never presented during a TLS handshake. ECDSA fixes that.
+// LoadCA still accepts a legacy Ed25519 root so an existing CA keeps
+// working. Browser leaves (IssueClientCert) are ECDSA P-256; agent leaves
+// (SignClientPubkey) stay Ed25519 so an agent can reuse its existing
+// identity.key as the TLS keypair — one private key, two uses, no new
+// on-disk material on the agent host. Cross-algorithm chains (e.g. an
+// ECDSA CA over an Ed25519 leaf) are valid X.509.
 package mtls
 
 import (
@@ -68,9 +73,11 @@ func LoadCABundle(path string) (*x509.CertPool, int, error) {
 	return pool, count, nil
 }
 
-// InitCA writes a fresh self-signed Ed25519 CA into dir as ca.key (0600)
-// and ca.pem (0644). With force=false it returns an error if either file
-// already exists. With force=true it overwrites both.
+// InitCA writes a fresh self-signed ECDSA P-256 CA into dir as ca.key
+// (0600) and ca.pem (0644). ECDSA (not Ed25519) is required so the leaves
+// this CA signs are usable for SSL client auth on Apple (macOS/iOS)
+// clients. With force=false it returns an error if either file already
+// exists. With force=true it overwrites both.
 func InitCA(dir string, force bool) error {
 	keyPath := filepath.Join(dir, caKeyFile)
 	certPath := filepath.Join(dir, caCertFile)
@@ -88,7 +95,7 @@ func InitCA(dir string, force bool) error {
 		return fmt.Errorf("mkdir %s: %w", dir, err)
 	}
 
-	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return fmt.Errorf("generate CA key: %w", err)
 	}
@@ -105,7 +112,7 @@ func InitCA(dir string, force bool) error {
 		BasicConstraintsValid: true,
 		IsCA:                  true,
 	}
-	der, err := x509.CreateCertificate(rand.Reader, tpl, tpl, pub, priv)
+	der, err := x509.CreateCertificate(rand.Reader, tpl, tpl, &priv.PublicKey, priv)
 	if err != nil {
 		return fmt.Errorf("create CA cert: %w", err)
 	}
@@ -129,10 +136,12 @@ func InitCA(dir string, force bool) error {
 	return nil
 }
 
-// CA is a loaded CA from a directory written by InitCA.
+// CA is a loaded CA from a directory written by InitCA. key is a
+// crypto.Signer so the CA can sign with either ECDSA (new roots from
+// InitCA) or Ed25519 (legacy roots loaded for backward compatibility).
 type CA struct {
 	cert *x509.Certificate
-	key  ed25519.PrivateKey
+	key  crypto.Signer
 }
 
 // LoadCA reads ca.key + ca.pem from dir. Used by the issue/sign
@@ -150,9 +159,9 @@ func LoadCA(dir string) (*CA, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse CA key: %w", err)
 	}
-	edKey, ok := rawKey.(ed25519.PrivateKey)
+	signer, ok := rawKey.(crypto.Signer)
 	if !ok {
-		return nil, fmt.Errorf("CA key is %T, want ed25519.PrivateKey", rawKey)
+		return nil, fmt.Errorf("CA key is %T, want crypto.Signer (ECDSA or Ed25519)", rawKey)
 	}
 
 	certBytes, err := os.ReadFile(filepath.Join(dir, caCertFile))
@@ -167,7 +176,7 @@ func LoadCA(dir string) (*CA, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse CA cert: %w", err)
 	}
-	return &CA{cert: cert, key: edKey}, nil
+	return &CA{cert: cert, key: signer}, nil
 }
 
 // ClientBundle is the result of IssueClientCert.
@@ -190,8 +199,10 @@ type ClientBundle struct {
 // surfaced live on 2026-05-23 trying to import a v1 (Ed25519)
 // bundle. P-256 is universally supported across browsers and
 // remains a sensible security floor (~128-bit equivalent). The CA
-// itself stays Ed25519 (cross-algorithm chains are normal X.509);
-// existing agent-side certs from SignClientPubkey are unaffected.
+// now signs with ECDSA P-256 too (see InitCA), which is what makes
+// the leaf actually usable by Apple clients; existing Ed25519
+// agent-side certs from SignClientPubkey remain valid (cross-algorithm
+// chains are normal X.509).
 func (c *CA) IssueClientCert(cn string, validFor time.Duration) (*ClientBundle, error) {
 	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -246,15 +257,15 @@ func (c *CA) IssueClientCert(cn string, validFor time.Duration) (*ClientBundle, 
 	// ~104 bits) -- and the .p12 is an ephemeral transport
 	// artifact deleted as soon as the target device imports.
 	// Intentionally omit the CA cert from the p12 chain (nil third
-	// arg). When the CA is Ed25519-signed, Apple Keychain's X.509
-	// parser bails on the import with OSStatus -26276 ("PKCS#12
-	// verify failure"), apparently because its strict-mode pre-flight
-	// of the chain rejects the Ed25519 signature algorithm OID even
-	// when the leaf itself is ECDSA. The leaf+key alone import
-	// cleanly. The browser doesn't need the CA cert at import time
-	// to present the leaf during a TLS handshake -- the CA only
-	// matters for chain verification on the SERVER side, which the
-	// daemon has covered via --mtls-ca.
+	// arg). The browser doesn't need the CA at import time to present
+	// the leaf during a TLS handshake -- the CA only matters for chain
+	// verification on the SERVER side, which the daemon covers via
+	// --mtls-ca. Omitting it is also the safe default for Apple import:
+	// a legacy Ed25519-signed CA in the bundled chain makes Keychain's
+	// strict-mode pre-flight bail with OSStatus -26276 ("PKCS#12 verify
+	// failure") even when the leaf itself is ECDSA. An ECDSA CA (the
+	// new default) would import fine in the chain, but the leaf alone is
+	// all the client needs to present either way.
 	p12, err := pkcs12.LegacyRC2.WithIterations(2048).Encode(priv, cert, nil, passphrase)
 	if err != nil {
 		return nil, fmt.Errorf("encode pkcs12: %w", err)
@@ -275,7 +286,8 @@ func (c *CA) SignClientPubkey(cn string, pub ed25519.PublicKey, validFor time.Du
 // ECDSA P-256 (browser flow via IssueClientCert). x509.CreateCertificate
 // accepts any supported public-key type via the empty interface,
 // so the function stays algorithm-agnostic for the leaf while the
-// CA's signing key (c.key) remains Ed25519.
+// CA's signing key (c.key, a crypto.Signer) may be ECDSA P-256 (new
+// roots from InitCA) or Ed25519 (legacy roots).
 func (c *CA) signPub(cn string, pub crypto.PublicKey, validFor time.Duration) ([]byte, error) {
 	serial, err := randomSerial()
 	if err != nil {

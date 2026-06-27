@@ -6,7 +6,9 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/pem"
+	"math/big"
 	"os"
 	"path/filepath"
 	"strings"
@@ -75,10 +77,12 @@ func TestLoadCABundle_ZeroCerts(t *testing.T) {
 	}
 }
 
-// TestInitCA_CreatesEd25519CA: a fresh InitCA writes ca.key (0600) and
-// ca.pem (0644). The key is Ed25519 and the cert is self-signed with the
-// IsCA flag set.
-func TestInitCA_CreatesEd25519CA(t *testing.T) {
+// TestInitCA_CreatesECDSACA: a fresh InitCA writes ca.key (0600) and
+// ca.pem (0644). The key is ECDSA P-256 and the cert is self-signed with
+// the IsCA flag set. ECDSA (not Ed25519) is required: Apple (macOS/iOS)
+// clients cannot evaluate an Ed25519 CA signature, so a leaf signed by an
+// Ed25519 CA imports but is never presented during a TLS handshake.
+func TestInitCA_CreatesECDSACA(t *testing.T) {
 	dir := t.TempDir()
 	if err := InitCA(dir, false); err != nil {
 		t.Fatalf("InitCA: %v", err)
@@ -104,8 +108,12 @@ func TestInitCA_CreatesEd25519CA(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse ca.key as PKCS8: %v", err)
 	}
-	if _, ok := rawKey.(ed25519.PrivateKey); !ok {
-		t.Fatalf("ca.key is %T, want ed25519.PrivateKey", rawKey)
+	ecKey, ok := rawKey.(*ecdsa.PrivateKey)
+	if !ok {
+		t.Fatalf("ca.key is %T, want *ecdsa.PrivateKey", rawKey)
+	}
+	if ecKey.Curve != elliptic.P256() {
+		t.Fatalf("ca.key curve = %v, want P-256", ecKey.Curve)
 	}
 
 	certPEM, err := os.ReadFile(filepath.Join(dir, "ca.pem"))
@@ -125,6 +133,9 @@ func TestInitCA_CreatesEd25519CA(t *testing.T) {
 	}
 	if cert.Issuer.String() != cert.Subject.String() {
 		t.Fatalf("ca.pem not self-signed: issuer=%s subject=%s", cert.Issuer, cert.Subject)
+	}
+	if cert.SignatureAlgorithm != x509.ECDSAWithSHA256 {
+		t.Fatalf("ca.pem signature alg = %v, want ECDSAWithSHA256", cert.SignatureAlgorithm)
 	}
 	if err := cert.CheckSignatureFrom(cert); err != nil {
 		t.Fatalf("ca.pem self-signature: %v", err)
@@ -233,6 +244,12 @@ func TestIssueClientCert_RoundTrip(t *testing.T) {
 	if cert.Subject.CommonName != "alice" {
 		t.Fatalf("CN = %q, want alice", cert.Subject.CommonName)
 	}
+	// The whole point of an ECDSA CA: the leaf carries an ECDSA CA
+	// signature, which Apple clients can actually evaluate. An Ed25519
+	// CA signature (the old behavior) imports but is never presented.
+	if cert.SignatureAlgorithm != x509.ECDSAWithSHA256 {
+		t.Fatalf("leaf signature alg = %v, want ECDSAWithSHA256 (CA must sign with ECDSA)", cert.SignatureAlgorithm)
+	}
 
 	pool, _, err := LoadCABundle(filepath.Join(dir, "ca.pem"))
 	if err != nil {
@@ -274,6 +291,87 @@ func TestIssueClientCert_RoundTrip(t *testing.T) {
 	}
 	if !pemECDSA.Equal(p12ECDSA) {
 		t.Fatal("KeyPEM and p12 key do not match")
+	}
+}
+
+// writeLegacyEd25519CA writes a self-signed Ed25519 CA (ca.key + ca.pem)
+// into dir, replicating exactly what InitCA produced before the ECDSA
+// switch. Used to prove LoadCA stays backward-compatible with the CA
+// already deployed in production.
+func writeLegacyEd25519CA(t *testing.T, dir string) {
+	t.Helper()
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("gen ed25519 CA key: %v", err)
+	}
+	tpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "swe-swe-tunnel mTLS CA (legacy ed25519)"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(10 * 365 * 24 * time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tpl, tpl, pub, priv)
+	if err != nil {
+		t.Fatalf("create legacy CA cert: %v", err)
+	}
+	pkcs8, err := x509.MarshalPKCS8PrivateKey(priv)
+	if err != nil {
+		t.Fatalf("marshal legacy CA key: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "ca.key"),
+		pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: pkcs8}), 0600); err != nil {
+		t.Fatalf("write legacy ca.key: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "ca.pem"),
+		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0644); err != nil {
+		t.Fatalf("write legacy ca.pem: %v", err)
+	}
+}
+
+// TestLoadCA_AcceptsLegacyEd25519Root: the production CA predates the ECDSA
+// switch and is Ed25519. LoadCA must keep loading it (via crypto.Signer)
+// and IssueClientCert must keep minting leaves that chain to it -- so the
+// existing iPad/iOS certs keep working while a new ECDSA CA is added
+// alongside. The leaf inherits the CA's Ed25519 signature here.
+func TestLoadCA_AcceptsLegacyEd25519Root(t *testing.T) {
+	dir := t.TempDir()
+	writeLegacyEd25519CA(t, dir)
+
+	ca, err := LoadCA(dir)
+	if err != nil {
+		t.Fatalf("LoadCA on legacy Ed25519 CA: %v", err)
+	}
+	if _, ok := ca.key.(ed25519.PrivateKey); !ok {
+		t.Fatalf("legacy CA key = %T, want ed25519.PrivateKey", ca.key)
+	}
+
+	bundle, err := ca.IssueClientCert("legacy-user", 90*24*time.Hour)
+	if err != nil {
+		t.Fatalf("IssueClientCert from legacy CA: %v", err)
+	}
+	cblk, _ := pem.Decode(bundle.CertPEM)
+	if cblk == nil {
+		t.Fatal("CertPEM did not decode")
+	}
+	cert, err := x509.ParseCertificate(cblk.Bytes)
+	if err != nil {
+		t.Fatalf("parse cert: %v", err)
+	}
+	if cert.SignatureAlgorithm != x509.PureEd25519 {
+		t.Fatalf("leaf signature alg = %v, want PureEd25519 (legacy CA signs Ed25519)", cert.SignatureAlgorithm)
+	}
+	pool, _, err := LoadCABundle(filepath.Join(dir, "ca.pem"))
+	if err != nil {
+		t.Fatalf("LoadCABundle: %v", err)
+	}
+	if _, err := cert.Verify(x509.VerifyOptions{
+		Roots:     pool,
+		KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	}); err != nil {
+		t.Fatalf("legacy-CA leaf does not chain to CA: %v", err)
 	}
 }
 

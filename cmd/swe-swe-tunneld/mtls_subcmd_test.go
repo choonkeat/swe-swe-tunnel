@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/ecdsa"
 	"crypto/ed25519"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/x509"
 	"encoding/base64"
@@ -26,7 +27,8 @@ func quietLogger() *slog.Logger {
 
 // TestMtlsInit_CreatesCA covers the happy path: `mtls-init` with no
 // flags writes ca.key (0600) + ca.pem into {state-dir}/mtls and the
-// cert parses as a self-signed Ed25519 CA.
+// cert parses as a self-signed ECDSA P-256 CA (ECDSA so leaves it signs
+// are usable by Apple clients; an Ed25519 CA signature is not).
 func TestMtlsInit_CreatesCA(t *testing.T) {
 	stateDir := t.TempDir()
 	var out bytes.Buffer
@@ -56,8 +58,11 @@ func TestMtlsInit_CreatesCA(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse CA cert: %v", err)
 	}
-	if _, ok := cert.PublicKey.(ed25519.PublicKey); !ok {
-		t.Errorf("CA pubkey type = %T, want ed25519.PublicKey", cert.PublicKey)
+	caPub, ok := cert.PublicKey.(*ecdsa.PublicKey)
+	if !ok {
+		t.Errorf("CA pubkey type = %T, want *ecdsa.PublicKey", cert.PublicKey)
+	} else if caPub.Curve != elliptic.P256() {
+		t.Errorf("CA pubkey curve = %v, want P-256", caPub.Curve)
 	}
 	if !cert.IsCA {
 		t.Error("CA cert IsCA=false")
