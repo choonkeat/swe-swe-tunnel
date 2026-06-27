@@ -48,8 +48,24 @@ second daemon without `--mtls-ca` on a separate hostname.
 
 ### Apple Keychain / iOS profile installer
 
+> ✅ **RESOLVED 2026-06-27.** Apple-client mTLS works. The complete
+> recipe has THREE parts; the 2026-06-23 finding had only one:
+> 1. **The CA must be ECDSA P-256, not Ed25519** — macOS refuses to
+>    import/trust an Ed25519 CA (`OSStatus -25257`), so the chain can
+>    never validate. `InitCA` now mints ECDSA P-256.
+> 2. **macOS must explicitly TRUST that CA** (`security add-trusted-cert
+>    -r trustRoot`). Skipping this leaves the imported identity
+>    `CSSMERR_TP_NOT_TRUSTED`, hidden from the SSL-client policy.
+> 3. The `.p12` packaging constraints below (for a clean import).
+>
+> **iOS/iPadOS were never broken** — they work with the *Ed25519* CA and
+> need no separate CA-trust step. The 2026-06-23 claim that macOS *and*
+> iOS were both broken was wrong about iOS. The daemon trusts a *bundle*
+> of both CAs, so existing iOS (Ed25519) certs and new macOS (ECDSA)
+> certs coexist. See "Apple client recipe" below.
+
 Apple's PKCS#12 import path is pickier than the format spec allows.
-`IssueClientCert` produces `.p12` files that work because it matches
+`IssueClientCert` produces `.p12` files that *import* because it matches
 what `openssl pkcs12 -export -legacy` emits. The four constraints
 baked into `internal/mtls/ca.go`:
 
@@ -61,12 +77,12 @@ baked into `internal/mtls/ca.go`:
   otherwise acceptable. RC2-40 is weak, but it's protecting only
   the public cert bag — the private-key bag stays 3DES.
 * **Key bag encryption**: `pbeWithSHAAnd3-KeyTripleDES-CBC` (3DES).
-* **Chain certs**: omit. Apple's pre-flight refuses the entire
-  bundle if any cert in the bundled chain has an Ed25519 signature
-  (OID `1.3.101.112`). Our internal CA is Ed25519-signed, so we
-  don't bundle the CA in the `.p12` — the browser only needs the
-  leaf to present during the TLS handshake, and the daemon already
-  has the CA via `--mtls-ca`.
+* **Chain certs**: omit from the `.p12` (nil third arg). The client
+  presents only the leaf during the handshake; the CA is imported and
+  trusted separately (see "Apple client recipe" below). Historically
+  Apple's import pre-flight also refused a bundle whose chain contained
+  an Ed25519-signed CA — moot now that the CA is ECDSA, but omitting is
+  still simplest.
 * **Leaf key algorithm**: ECDSA P-256. Ed25519 leaves are rejected
   with "Unable to decode the provided data" on older macOS / iOS,
   inconsistently on newer.
@@ -74,6 +90,72 @@ baked into `internal/mtls/ca.go`:
 The agent flow (`SignClientPubkey`, `mtls-sign`) is NOT affected by
 any of this — agents reuse their Ed25519 `identity.key` and the
 signed `.crt` is delivered as a raw PEM, never wrapped in PKCS#12.
+
+#### Apple client recipe (corrected 2026-06-27)
+
+The 2026-06-23 finding diagnosed only the CA *algorithm*, wrongly
+concluded both macOS and iOS were broken, and claimed "the browser only
+needs the leaf." Re-tested end-to-end on 2026-06-27 — including
+verifying the live daemon accepts an ECDSA-CA leaf in a real mTLS
+handshake *before* touching the Mac (a cert-less request gets
+`certificate required`; one presenting the ECDSA leaf gets through).
+
+**iOS / iPadOS** — work with the **Ed25519** CA, no special steps:
+install the `.p12` and the identity is offered. None of the macOS steps
+below apply; do not re-issue working iOS certs.
+
+**macOS (Safari/Chrome)** needs all three:
+
+1. **ECDSA P-256 CA.** macOS will not import an Ed25519 CA cert
+   (`OSStatus -25257`), so that chain can never be trusted. `InitCA`
+   now mints ECDSA P-256; `LoadCA` still loads a legacy Ed25519 CA for
+   backward compatibility.
+2. **Import the leaf identity:**
+   ```sh
+   security import user-mac.p12 \
+     -k ~/Library/Keychains/login.keychain-db \
+     -P "$(cat user-mac.txt)" -T /Applications/Safari.app
+   ```
+3. **Trust the CA** (the step the old finding missed):
+   ```sh
+   security add-trusted-cert -r trustRoot \
+     -k ~/Library/Keychains/login.keychain-db swe-swe-tunnel-ecdsa-ca.pem
+   # if still untrusted, use the system domain:
+   # sudo security add-trusted-cert -d -r trustRoot \
+   #   -k /Library/Keychains/System.keychain swe-swe-tunnel-ecdsa-ca.pem
+   ```
+   Without this the identity imports but `security find-identity` shows
+   `CSSMERR_TP_NOT_TRUSTED` and `-p ssl-client` lists 0 — macOS hides an
+   untrusted identity from the SSL-client policy.
+
+**Verification rule — never declare an Apple mTLS cert "working" on
+"1 identity imported" alone.** Require BOTH:
+
+```sh
+# 1. macOS lists it as VALID for the SSL-client policy:
+security find-identity -p ssl-client      # must contain the CN
+# 2. a real handshake presents it (Safari cert picker -> page loads;
+#    daemon stops logging "client didn't provide a certificate").
+```
+
+**Per-origin prompt.** Safari asks which client cert to use once per
+host. With many `<port>.<tunnel>-tunnel.<apex>` origins that is a lot of
+prompts. Suppress with an Identity Preference (one wildcard covers all
+tunnels):
+
+```sh
+security set-identity-preference -c "user-mac" -s "https://*.example.com"
+# then quit & reopen Safari
+```
+
+**Server side.** `--mtls-ca` is a *bundle*; the daemon trusts every CA
+in it (`LoadCABundle`, SIGHUP-reloadable). Production carries BOTH the
+original Ed25519 CA (for existing iOS/iPad certs) and a new ECDSA CA at
+`{state}/mtls-ecdsa/` (for macOS and all new certs); the ECDSA cert is
+appended to `{state}/mtls/ca.pem` and SIGHUP-reloaded — no recreate, no
+flap. New certs (including future iPad/iOS) should be issued from the
+ECDSA CA. Tracked in
+`docs/findings-2026-06-23-macos-mtls-ed25519-ca.md`.
 
 iOS displays imported certs with the generic label "Identity
 Certificate" because go-pkcs12's `Encode` doesn't expose the
