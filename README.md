@@ -77,9 +77,24 @@ swe-swe-tunnel \
   --unique=alice
 ```
 
-On first run it generates `~/.swe-swe-tunnel/identity.key` and registers as `alice-tunnel.example.com`.
+On the **first run** with no key present, the client generates
+`~/.swe-swe-tunnel/identity.key`, prints its public key + path, and
+**exits without connecting** -- so it never burns a registration attempt
+with a pubkey the server hasn't allowlisted yet:
 
-> **Deploying on a PaaS / container with no persistent volume?**
+```
+Generated a new tunnel identity key.
+  path:   ~/.swe-swe-tunnel/identity.key
+  pubkey: uLClVZEOZsI8F+SSU8TZUxZL4tUtne+Ow9Ofv4BXRrI
+```
+
+Get that pubkey allowlisted (if the server enforces an allowlist), then
+run the same command again -- the second run reuses the key on disk and
+registers as `alice-tunnel.example.com`. (`--unique` is required; the
+client exits if it is missing.)
+
+> **Already have a key, or deploying on a PaaS / container with no persistent volume?**
+> Supply your own and the first-run generate/exit step never fires.
 > Hand the identity in via env var instead of a file — the client will skip disk I/O entirely. Generate the key once, locally, and stash both halves where they belong:
 >
 > ```sh

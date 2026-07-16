@@ -9,6 +9,7 @@ import (
 	"crypto/ed25519"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/pem"
 	"errors"
 	"flag"
@@ -80,11 +81,36 @@ func main() {
 		os.Exit(2)
 	}
 
-	priv, err := tunnelclient.LoadIdentity(*identityKey, logger)
+	priv, generated, err := tunnelclient.LoadIdentityStatus(*identityKey, logger)
 	if err != nil {
 		logger.Error("identity key", "path", *identityKey, "err", err)
 		emitter.Emit(tunnelclient.EventFatal, tunnelclient.FatalData{
+			Reason:   "identity_error",
 			Message:  fmt.Sprintf("identity key %q: %v", *identityKey, err),
+			ExitCode: 1,
+		})
+		os.Exit(1)
+	}
+	// First boot: the key was just generated, so its public half has
+	// never been allowlisted on the tunnel server. Connecting now would
+	// only burn a rate-limited registration attempt. Print the pubkey +
+	// path so the operator can allowlist it, emit a fatal event so the
+	// swe-swe-server supervisor stops instead of restart-looping, and
+	// exit. The next boot finds the key on disk and connects normally.
+	// (LoadIdentityStatus reports generated=false for the inline
+	// SWE_TUNNEL_IDENTITY_KEY env path, so this never fires there.)
+	if generated {
+		pub := priv.Public().(ed25519.PublicKey)
+		pubB64 := base64.RawStdEncoding.EncodeToString(pub)
+		fmt.Fprintf(os.Stderr,
+			"\nGenerated a new tunnel identity key.\n"+
+				"  path:   %s\n"+
+				"  pubkey: %s\n\n"+
+				"Allowlist this pubkey on the tunnel server, then start again.\n\n",
+			*identityKey, pubB64)
+		emitter.Emit(tunnelclient.EventFatal, tunnelclient.FatalData{
+			Reason:   "identity_generated",
+			Message:  fmt.Sprintf("generated new identity %s; allowlist pubkey %s then restart", *identityKey, pubB64),
 			ExitCode: 1,
 		})
 		os.Exit(1)

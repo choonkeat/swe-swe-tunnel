@@ -83,7 +83,13 @@ type ErrorData struct {
 }
 
 // FatalData is the payload of an EventFatal event.
+//
+// Reason is a short machine-readable slug (e.g. "identity_generated",
+// "unique_required") that a supervisor can switch on; the swe-swe-server
+// tunnel supervisor reads this field to decide it must stop rather than
+// restart. Message is the human-readable detail.
 type FatalData struct {
+	Reason   string `json:"reason,omitempty"`
 	Message  string `json:"message"`
 	ExitCode int    `json:"exit_code"`
 }

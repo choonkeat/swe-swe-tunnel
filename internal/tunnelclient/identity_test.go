@@ -16,6 +16,16 @@ import (
 	"testing"
 )
 
+// TestMain clears any ambient SWE_TUNNEL_IDENTITY_KEY before running the
+// suite. Dev containers export it, which would otherwise steer the
+// file-path tests down the env branch (source=env) and break their
+// assertions. Tests that need the env path set it explicitly via
+// t.Setenv, which restores the (now-unset) value afterward.
+func TestMain(m *testing.M) {
+	os.Unsetenv(IdentityKeyEnv)
+	os.Exit(m.Run())
+}
+
 func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
@@ -359,6 +369,63 @@ func TestLoadIdentity_FingerprintIsStableAcrossSources(t *testing.T) {
 
 	if fpFile != fpEnv {
 		t.Errorf("fingerprint differs across sources for the same key: file=%q env=%q", fpFile, fpEnv)
+	}
+}
+
+// --------------------------------------------------------------------------
+// LoadIdentityStatus — generated flag (first-boot bootstrap gate)
+// --------------------------------------------------------------------------
+
+// A missing key file must report generated=true: this is the first-boot
+// case main() intercepts to print the pubkey and exit before burning a
+// registration attempt.
+func TestLoadIdentityStatus_GeneratedOnFreshFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "id.key")
+
+	priv, generated, err := LoadIdentityStatus(path, discardLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !generated {
+		t.Error("generated = false on a missing key file; want true")
+	}
+	if len(priv) != ed25519.PrivateKeySize {
+		t.Fatalf("priv size = %d, want %d", len(priv), ed25519.PrivateKeySize)
+	}
+}
+
+// An existing key file must report generated=false: the second boot
+// reuses the on-disk key and connects normally.
+func TestLoadIdentityStatus_NotGeneratedOnReuse(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "id.key")
+	if _, err := LoadOrCreateIdentity(path, discardLogger()); err != nil {
+		t.Fatal(err)
+	}
+
+	_, generated, err := LoadIdentityStatus(path, discardLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if generated {
+		t.Error("generated = true on an existing key file; want false")
+	}
+}
+
+// The inline SWE_TUNNEL_IDENTITY_KEY path never touches disk, so it must
+// always report generated=false — the bootstrap gate must NOT fire there.
+func TestLoadIdentityStatus_EnvNeverGenerated(t *testing.T) {
+	_, envKey, _ := ed25519.GenerateKey(rand.Reader)
+	t.Setenv(IdentityKeyEnv, pemB64(t, envKey))
+	// A non-existent path: if generated were derived from the file's
+	// absence we'd wrongly get true here.
+	path := filepath.Join(t.TempDir(), "nope", "id.key")
+
+	_, generated, err := LoadIdentityStatus(path, discardLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if generated {
+		t.Error("generated = true on the inline-env path; want false (env never touches disk)")
 	}
 }
 

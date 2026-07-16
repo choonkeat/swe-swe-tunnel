@@ -43,23 +43,37 @@ const IdentityKeyEnv = "SWE_TUNNEL_IDENTITY_KEY"
 // 12-hex-prefix fingerprint of the public key, so an operator can confirm
 // "yes I deployed the right key" from the boot log alone.
 func LoadIdentity(filePath string, logger *slog.Logger) (ed25519.PrivateKey, error) {
+	priv, _, err := LoadIdentityStatus(filePath, logger)
+	return priv, err
+}
+
+// LoadIdentityStatus is LoadIdentity plus a `generated` flag reporting
+// whether the on-disk key was freshly created on THIS call. It is always
+// false for the env-supplied path (SWE_TUNNEL_IDENTITY_KEY never touches
+// disk) and false when an existing key file is reused.
+//
+// main() uses this to intercept the first-boot case: when the key was
+// just generated, its public half has never been allowlisted on the
+// tunnel server, so connecting would only burn a rate-limited
+// registration attempt. Instead we print the pubkey + path and exit.
+func LoadIdentityStatus(filePath string, logger *slog.Logger) (ed25519.PrivateKey, bool, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	if envB64 := os.Getenv(IdentityKeyEnv); envB64 != "" {
 		priv, err := parseB64Identity(envB64)
 		if err != nil {
-			return nil, fmt.Errorf("%s: %w", IdentityKeyEnv, err)
+			return nil, false, fmt.Errorf("%s: %w", IdentityKeyEnv, err)
 		}
 		logIdentityFingerprint(logger, priv, "env", "")
-		return priv, nil
+		return priv, false, nil
 	}
-	priv, err := LoadOrCreateIdentity(filePath, logger)
+	priv, generated, err := loadOrCreateIdentity(filePath, logger)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	logIdentityFingerprint(logger, priv, "file", filePath)
-	return priv, nil
+	return priv, generated, nil
 }
 
 // parseB64Identity decodes a base64-encoded PKCS8 PEM block into an
@@ -115,6 +129,15 @@ func logIdentityFingerprint(logger *slog.Logger, priv ed25519.PrivateKey, source
 // fingerprint log line. LoadOrCreateIdentity remains the file-only entry
 // point for tests and for callers that explicitly want the on-disk path.
 func LoadOrCreateIdentity(path string, logger *slog.Logger) (ed25519.PrivateKey, error) {
+	priv, _, err := loadOrCreateIdentity(path, logger)
+	return priv, err
+}
+
+// loadOrCreateIdentity is the implementation shared by LoadOrCreateIdentity
+// and LoadIdentityStatus. The second return value reports whether the key
+// was generated on this call (true) versus read from an existing file
+// (false).
+func loadOrCreateIdentity(path string, logger *slog.Logger) (ed25519.PrivateKey, bool, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -122,37 +145,37 @@ func LoadOrCreateIdentity(path string, logger *slog.Logger) (ed25519.PrivateKey,
 	if err == nil {
 		block, _ := pem.Decode(data)
 		if block == nil {
-			return nil, fmt.Errorf("identity key: not PEM")
+			return nil, false, fmt.Errorf("identity key: not PEM")
 		}
 		key, err := x509.ParsePKCS8PrivateKey(block.Bytes)
 		if err != nil {
-			return nil, fmt.Errorf("parse PKCS8: %w", err)
+			return nil, false, fmt.Errorf("parse PKCS8: %w", err)
 		}
 		priv, ok := key.(ed25519.PrivateKey)
 		if !ok {
-			return nil, fmt.Errorf("identity key is %T, want ed25519.PrivateKey", key)
+			return nil, false, fmt.Errorf("identity key is %T, want ed25519.PrivateKey", key)
 		}
-		return priv, nil
+		return priv, false, nil
 	}
 	if !errors.Is(err, os.ErrNotExist) {
-		return nil, fmt.Errorf("read identity key: %w", err)
+		return nil, false, fmt.Errorf("read identity key: %w", err)
 	}
 
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return nil, fmt.Errorf("mkdir for identity key: %w", err)
+		return nil, false, fmt.Errorf("mkdir for identity key: %w", err)
 	}
 	_, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
-		return nil, fmt.Errorf("generate key: %w", err)
+		return nil, false, fmt.Errorf("generate key: %w", err)
 	}
 	der, err := x509.MarshalPKCS8PrivateKey(priv)
 	if err != nil {
-		return nil, fmt.Errorf("marshal PKCS8: %w", err)
+		return nil, false, fmt.Errorf("marshal PKCS8: %w", err)
 	}
 	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der})
 	if err := os.WriteFile(path, pemBytes, 0o600); err != nil {
-		return nil, fmt.Errorf("write identity key: %w", err)
+		return nil, false, fmt.Errorf("write identity key: %w", err)
 	}
 	logger.Info("generated new identity key", "path", path)
-	return priv, nil
+	return priv, true, nil
 }

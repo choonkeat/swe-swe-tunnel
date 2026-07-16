@@ -3,7 +3,11 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"io"
 	"os"
@@ -17,6 +21,42 @@ import (
 
 	"github.com/choonkeat/swe-swe-tunnel/internal/tunneldfake"
 )
+
+// provisionKey writes a fresh Ed25519 identity key (PKCS8 PEM) to path so
+// the binary reuses it instead of generating one. Lifecycle tests that
+// exercise connect/register need a key already on disk: a missing key now
+// triggers the first-boot generate-and-exit path (see
+// TestBinary_FreshKey_GeneratesAndExits).
+// scrubIdentityEnv returns environ with the identity-related vars removed
+// so tests are not affected by an ambient SWE_TUNNEL_IDENTITY_KEY /
+// SWE_TUNNEL_KEY exported by the surrounding dev container.
+func scrubIdentityEnv(environ []string) []string {
+	out := environ[:0:0]
+	for _, kv := range environ {
+		if strings.HasPrefix(kv, "SWE_TUNNEL_IDENTITY_KEY=") ||
+			strings.HasPrefix(kv, "SWE_TUNNEL_KEY=") {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return out
+}
+
+func provisionKey(t *testing.T, path string) {
+	t.Helper()
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	der, err := x509.MarshalPKCS8PrivateKey(priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der})
+	if err := os.WriteFile(path, pemBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
 
 // buildTunnelBinary compiles cmd/swe-swe-tunnel into a temp directory
 // and returns the absolute path. The binary is reused across subtests
@@ -59,7 +99,11 @@ func runBinary(t *testing.T, args []string, env []string, untilStdout func(seen 
 	t.Helper()
 
 	cmd := exec.Command(binaryPath(t), args...)
-	cmd.Env = append(os.Environ(), env...)
+	// Scrub any ambient identity env so tests control identity solely via
+	// --identity-key or the explicit env param. Dev containers may export
+	// SWE_TUNNEL_IDENTITY_KEY, which would otherwise override the on-disk
+	// key and make the generate/reuse behavior non-deterministic.
+	cmd.Env = append(scrubIdentityEnv(os.Environ()), env...)
 
 	var (
 		stdout bytes.Buffer
@@ -155,6 +199,7 @@ func TestBinary_DefaultFormat_StdoutEmpty(t *testing.T) {
 	}
 	f := startFake(t)
 	keyDir := t.TempDir()
+	provisionKey(t, filepath.Join(keyDir, "id.key"))
 
 	stdout, stderr, exitErr := runBinary(t,
 		[]string{
@@ -203,6 +248,7 @@ func TestBinary_JSONLFormat_StdoutHasLifecycle(t *testing.T) {
 	}
 	f := startFake(t)
 	keyDir := t.TempDir()
+	provisionKey(t, filepath.Join(keyDir, "id.key"))
 
 	stdout, stderr, _ := runBinary(t,
 		[]string{
@@ -275,6 +321,7 @@ func TestBinary_JSONLFormat_EnvVar(t *testing.T) {
 	}
 	f := startFake(t)
 	keyDir := t.TempDir()
+	provisionKey(t, filepath.Join(keyDir, "id.key"))
 
 	stdout, _, _ := runBinary(t,
 		[]string{
@@ -312,6 +359,76 @@ func TestBinary_BadReportFormat_ExitsNonZero(t *testing.T) {
 	}
 	if !bytes.Contains(out, []byte("invalid --report-format")) {
 		t.Errorf("expected 'invalid --report-format' in stderr, got:\n%s", out)
+	}
+}
+
+// TestBinary_FreshKey_GeneratesAndExits covers the first-boot bootstrap:
+// with no identity key on disk, the binary generates one, prints the
+// pubkey + path to stderr, emits a fatal(identity_generated) event, and
+// exits non-zero WITHOUT connecting — so it never burns a registration
+// attempt against an un-allowlisted pubkey.
+func TestBinary_FreshKey_GeneratesAndExits(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skip in -short: builds the binary")
+	}
+	// No fake server needed: the binary must exit before dialing. Point
+	// --server at an unroutable address to prove no connection is made.
+	keyPath := filepath.Join(t.TempDir(), "id.key")
+
+	stdout, stderr, exitErr := runBinary(t,
+		[]string{
+			"--server", "https://127.0.0.1:1",
+			"--unique", "alpha",
+			"--insecure",
+			"--identity-key", keyPath,
+			"--report-format", "jsonl",
+		},
+		nil,
+		// Signal as soon as the fatal event lands so we don't wait out
+		// the deadline.
+		func(line string) bool { return strings.Contains(line, `"kind":"fatal"`) },
+		nil,
+		15*time.Second,
+	)
+
+	// Non-zero exit.
+	var ee *exec.ExitError
+	if !errors.As(exitErr, &ee) {
+		t.Fatalf("expected non-zero exit, got err=%v\nstderr:\n%s", exitErr, stderr)
+	}
+	if ee.ExitCode() != 1 {
+		t.Errorf("exit code = %d, want 1\nstderr:\n%s", ee.ExitCode(), stderr)
+	}
+
+	// stderr: human-facing pubkey + path + instruction.
+	if !bytes.Contains(stderr, []byte("Generated a new tunnel identity key")) {
+		t.Errorf("stderr missing generate notice:\n%s", stderr)
+	}
+	if !bytes.Contains(stderr, []byte(keyPath)) {
+		t.Errorf("stderr missing key path %q:\n%s", keyPath, stderr)
+	}
+	if !bytes.Contains(stderr, []byte("pubkey:")) {
+		t.Errorf("stderr missing pubkey line:\n%s", stderr)
+	}
+
+	// stdout jsonl: exactly the fatal(identity_generated) event, and NO
+	// connect/register lifecycle events (we never touched the network).
+	kinds := parseKinds(t, stdout)
+	if !contains(kinds, "fatal") {
+		t.Errorf("stdout missing fatal event; kinds=%v", kinds)
+	}
+	for _, forbidden := range []string{"connecting", "register_ok", "registered"} {
+		if contains(kinds, forbidden) {
+			t.Errorf("stdout contains %q — binary connected despite fresh key; kinds=%v", forbidden, kinds)
+		}
+	}
+	if !bytes.Contains(stdout, []byte(`"reason":"identity_generated"`)) {
+		t.Errorf("stdout fatal event missing reason=identity_generated:\n%s", stdout)
+	}
+
+	// The key was persisted, so the NEXT boot reuses it (generated=false).
+	if _, err := os.Stat(keyPath); err != nil {
+		t.Errorf("key file not persisted: %v", err)
 	}
 }
 
