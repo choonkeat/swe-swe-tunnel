@@ -1,6 +1,6 @@
 module github.com/choonkeat/swe-swe-tunnel
 
-go 1.24.13
+go 1.26.10
 
 require (
 	github.com/go-acme/lego/v4 v4.21.0
