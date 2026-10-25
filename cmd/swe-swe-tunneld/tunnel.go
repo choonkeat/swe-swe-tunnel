@@ -23,6 +23,7 @@ import (
 	"github.com/hashicorp/yamux"
 
 	"github.com/choonkeat/swe-swe-tunnel/internal/allowlist"
+	"github.com/choonkeat/swe-swe-tunnel/internal/cert"
 	"github.com/choonkeat/swe-swe-tunnel/internal/control"
 	"github.com/choonkeat/swe-swe-tunnel/internal/identity"
 	"github.com/choonkeat/swe-swe-tunnel/internal/portpolicy"
@@ -192,7 +193,7 @@ func connectHandler(
 	apex string,
 	ipLimiter *ratelimit.SlidingWindow,
 	pubkeyLimiter *ratelimit.SlidingWindow,
-	skewDenyLimiter *ratelimit.SlidingWindow,
+	refundLimiter *ratelimit.SlidingWindow,
 	allow *allowlist.Set,
 	logger *slog.Logger,
 ) http.Handler {
@@ -314,7 +315,7 @@ func connectHandler(
 			}
 		}()
 
-		regResult, ok := handleRegister(ctx, stream, store, certMgr, ipLimiter, pubkeyLimiter, skewDenyLimiter, allow, logger, conn.RemoteAddr().String(), peerCertPub)
+		regResult, ok := handleRegister(ctx, stream, store, certMgr, ipLimiter, pubkeyLimiter, refundLimiter, allow, logger, conn.RemoteAddr().String(), peerCertPub)
 		if !ok {
 			return
 		}
@@ -377,6 +378,32 @@ type registerResult struct {
 // register a different identity is a configuration error (or a
 // hostile attempt to ride one cert to register another key). Deny
 // shape mirrors the existing allowlist refusal: not_authorized.
+// mayRefund reports whether one more refund is allowed for ipKey. All
+// refund paths (clock-skew deny, grace abort, transient cert failure)
+// share this per-IP budget. nil means no cap (unit tests). A disabled
+// limiter (max <= 0) means no refunds at all, matching the
+// --register-rate-skew-deny-per-hour=0 help text.
+func mayRefund(refundLimiter *ratelimit.SlidingWindow, ipKey string) bool {
+	if refundLimiter == nil {
+		return true
+	}
+	if refundLimiter.Max() <= 0 {
+		return false
+	}
+	return refundLimiter.Allow(ipKey)
+}
+
+// refundRegister gives back the IP and pubkey samples this Register
+// consumed.
+func refundRegister(ipLimiter, pubkeyLimiter *ratelimit.SlidingWindow, ipKey string, pub ed25519.PublicKey) {
+	if ipLimiter != nil {
+		ipLimiter.CancelLatest(ipKey)
+	}
+	if pubkeyLimiter != nil {
+		pubkeyLimiter.CancelLatest(string(pub))
+	}
+}
+
 func handleRegister(
 	ctx context.Context,
 	stream io.ReadWriter,
@@ -384,7 +411,7 @@ func handleRegister(
 	certMgr certEnsurer,
 	ipLimiter *ratelimit.SlidingWindow,
 	pubkeyLimiter *ratelimit.SlidingWindow,
-	skewDenyLimiter *ratelimit.SlidingWindow,
+	refundLimiter *ratelimit.SlidingWindow,
 	allow *allowlist.Set,
 	logger *slog.Logger,
 	remoteAddr string,
@@ -456,10 +483,8 @@ func handleRegister(
 		// limiter takes over (sustained skew failures escalate to
 		// rate_limited:ip after ~5 more attempts, which is the right
 		// signal for "your clock isn't drifting, it's broken").
-		if skewDenyLimiter == nil || skewDenyLimiter.Allow(ipKey) {
-			if ipLimiter != nil {
-				ipLimiter.CancelLatest(ipKey)
-			}
+		if mayRefund(refundLimiter, ipKey) && ipLimiter != nil {
+			ipLimiter.CancelLatest(ipKey)
 		}
 		sendDeny(stream, "timestamp out of range")
 		return registerResult{}, false
@@ -545,11 +570,10 @@ func handleRegister(
 				// proceed to EnsureName
 			case <-ctx.Done():
 				graceTimer.Stop()
-				if ipLimiter != nil {
-					ipLimiter.CancelLatest(ipKey)
-				}
-				if pubkeyLimiter != nil {
-					pubkeyLimiter.CancelLatest(string(pub))
+				// Same per-IP refund budget as the other refund paths,
+				// so connect-then-abort cannot loop for free.
+				if mayRefund(refundLimiter, ipKey) {
+					refundRegister(ipLimiter, pubkeyLimiter, ipKey, pub)
 				}
 				logger.Info("register aborted by client during issuance grace",
 					"unique", reg.Unique,
@@ -574,19 +598,25 @@ func handleRegister(
 			if strings.HasPrefix(err.Error(), "cert not provisioned") {
 				deny = "cert not provisioned"
 			}
-			// Refund the IP and pubkey budget tokens we consumed above:
-			// cert issuance failed for server-side reasons (ACME / DNS
-			// propagation / LE rate limit, or operator hasn't dropped
-			// the cert in --no-acme mode) — nothing the client did.
-			// Without this refund a transient cert flake would lock
-			// the operator's IP and key out for a full window — a
-			// self-inflicted DoS each time DNSimple's edge is slow.
-			if ipLimiter != nil {
-				ipLimiter.CancelLatest(ipKey)
+			// Refund the IP and pubkey budget tokens we consumed above
+			// when the failure is transient (ACME / DNS flake): without
+			// it a slow DNS edge would lock the operator's IP and key
+			// out for a full window.
+			//
+			// Two limits keep the refund from becoming a free loop:
+			//   - permanent failures (our order cap, LE rate limit,
+			//     --no-acme "not provisioned") are never refunded;
+			//     retrying cannot succeed, so the burn is correct.
+			//   - refunds share the per-IP refund budget with the
+			//     skew-deny path; past it, attempts burn as normal.
+			permanent := cert.IsPermanent(err)
+			refunded := !permanent && mayRefund(refundLimiter, ipKey)
+			if refunded {
+				refundRegister(ipLimiter, pubkeyLimiter, ipKey, pub)
 			}
-			if pubkeyLimiter != nil {
-				pubkeyLimiter.CancelLatest(string(pub))
-			}
+			logger.Info("register cert failure budget",
+				"unique", reg.Unique, "remote", remoteAddr,
+				"permanent", permanent, "refunded", refunded)
 			sendDeny(stream, deny)
 			return registerResult{}, false
 		}

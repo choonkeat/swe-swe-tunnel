@@ -15,6 +15,9 @@ All flags can be set via env. Every env var is also a flag, and vice versa.
 | `--ensure-cert` | — | (off) | no | Admin one-shot: issue `*.{label}.{apex}` and exit. No-op in `--no-acme` mode (issuance is external). |
 | `--register-rate-ip-per-hour` | — | `5` | no | Per-IP REGISTER limit. `0` disables. |
 | `--register-rate-pubkey-per-day` | — | `10` | no | Per-pubkey REGISTER limit. `0` disables. |
+| `--register-rate-skew-deny-per-hour` | — | `10` | no | Per-IP budget of refunded REGISTER attempts. Shared by clock-skew denies, transient cert failures and client aborts during the issuance grace. Past it, attempts count against `--register-rate-ip-per-hour`. Permanent cert failures (LE rate limit, order cap, `--no-acme` "not provisioned") are never refunded. `0` = no refunds. |
+| `--acme-orders-per-hour` | — | `20` | no | Server-wide cap on new-name ACME orders per hour, all clients combined. Protects the LE account limit (300 new orders / 3 h). Renewals are exempt. `0` disables. |
+| `--acme-orders-concurrent` | — | `3` | no | Max new-name ACME orders running at once. Over the cap, Register gets `cert issuance failed` right away. `0` disables. |
 | `--allowlist-dir` | `SWE_TUNNEL_ALLOWLIST_DIR` | (off; Compose: `/etc/swe-swe-tunneld/allowlist`) | one of these two | Directory of authorized pubkey files; gates Register. See [`docs/access-control.md`](access-control.md). |
 | `--open-registration` | `SWE_TUNNEL_OPEN_REGISTRATION` (set to `1`) | `false` | one of these two | Let any key register. The daemon refuses to boot unless exactly one of `--allowlist-dir` / `--open-registration` is set. |
 | `--allowed-ports` | `SWE_TUNNEL_ALLOWED_PORTS` | `1977,3000-3099,4000-4099,5000-5099,5173,8000-8099,8080,8081,9898,20000-29999` | no | Inline destination-port allowlist; `all` disables the gate. Restart-only. |

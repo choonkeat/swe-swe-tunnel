@@ -32,6 +32,8 @@ import (
 	"github.com/go-acme/lego/v4/lego"
 	"github.com/go-acme/lego/v4/registration"
 	"golang.org/x/sync/singleflight"
+
+	"github.com/choonkeat/swe-swe-tunnel/internal/ratelimit"
 )
 
 const (
@@ -68,7 +70,27 @@ type Manager struct {
 	// via New, which leaves it nil.
 	obtainOverride func(ctx context.Context, sans []string, baseName string) (*tls.Certificate, error)
 
+	// orderLimit caps new ACME orders started by EnsureName across all
+	// clients (per hour), and orderSlots caps how many run at once.
+	// Both nil = no cap. Renewals (checkAndRenew) are not counted, so a
+	// Register flood cannot block the operator's own renewals. Set via
+	// SetOrderLimit.
+	orderLimit *ratelimit.SlidingWindow
+	orderSlots chan struct{}
+
 	logger *slog.Logger
+}
+
+// SetOrderLimit caps new-name ACME orders at perHour per hour and
+// concurrent running at once. Zero or negative disables that cap.
+// Over the cap, EnsureName fails fast with ErrOrderLimit.
+func (m *Manager) SetOrderLimit(perHour, concurrent int) {
+	if perHour > 0 {
+		m.orderLimit = ratelimit.New(perHour, time.Hour)
+	}
+	if concurrent > 0 {
+		m.orderSlots = make(chan struct{}, concurrent)
+	}
 }
 
 type certEntry struct {
@@ -184,6 +206,20 @@ func (m *Manager) ensureSANs(ctx context.Context, sans []string, baseName string
 				"expires_in", expiresIn(cert).Round(time.Hour))
 			m.store.addEntry(&certEntry{cert: cert, sans: dnsNamesFromCert(cert), baseName: baseName})
 			return nil, nil
+		}
+
+		if m.orderSlots != nil {
+			select {
+			case m.orderSlots <- struct{}{}:
+				defer func() { <-m.orderSlots }()
+			default:
+				m.logger.Warn("acme order refused: too many running", "sans", sans, "max", cap(m.orderSlots))
+				return nil, ErrOrderLimit
+			}
+		}
+		if m.orderLimit != nil && !m.orderLimit.Allow("global") {
+			m.logger.Warn("acme order refused: hourly cap reached", "sans", sans)
+			return nil, ErrOrderLimit
 		}
 
 		m.logger.Info("issuing cert", "sans", sans, "ca", m.CADirURL)

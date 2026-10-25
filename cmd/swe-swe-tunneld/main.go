@@ -82,7 +82,16 @@ func main() {
 		// rate_limited:ip — which is the correct signal for "your
 		// clock isn't drifting, it's broken." 0 disables the refund
 		// entirely (every skew deny burns the main budget).
-		registerSkewDenyLimit = flag.Int("register-rate-skew-deny-per-hour", 10, "max refunded 'timestamp out of range' denies per source IP per hour (0 = no refund)")
+		//
+		// The same per-IP budget also covers the other refund paths:
+		// transient cert-issuance failures and client aborts during the
+		// issuance grace. Permanent cert failures are never refunded.
+		registerSkewDenyLimit = flag.Int("register-rate-skew-deny-per-hour", 10, "max refunded Register attempts per source IP per hour, shared by clock-skew denies, transient cert failures and grace aborts (0 = no refund)")
+		// Server-wide cap on NEW ACME orders started by Register, across
+		// all clients. Protects the Let's Encrypt account limits (300 new
+		// orders per 3 hours) from Register floods. Renewals are exempt.
+		acmeOrdersPerHour  = flag.Int("acme-orders-per-hour", 20, "max new-name ACME orders per hour, all clients combined (0 = no cap); renewals are exempt")
+		acmeOrdersParallel = flag.Int("acme-orders-concurrent", 3, "max new-name ACME orders running at once (0 = no cap)")
 		// Lego's defaults (PropagationTimeout=60s, PollingInterval=2s) are
 		// too tight for DNSimple's edge nameservers under load — we've seen
 		// real-world TXT propagation occasionally take 2–4 minutes, which
@@ -266,6 +275,8 @@ func main() {
 			}, nil
 		}
 		mgr := cert.New(*stateDir, *email, *apex, providerFactory, logger)
+		mgr.SetOrderLimit(*acmeOrdersPerHour, *acmeOrdersParallel)
+		logger.Info("acme order limits", "per_hour", *acmeOrdersPerHour, "concurrent", *acmeOrdersParallel)
 		if *staging {
 			mgr.SetStaging()
 			logger.Info("ACME staging mode (browser will not trust the cert)")
@@ -318,7 +329,7 @@ func main() {
 	logger.Info("register rate limits",
 		"ip_per_hour", *registerIPLimit,
 		"pubkey_per_day", *registerKeyLimit,
-		"skew_deny_refund_per_hour", *registerSkewDenyLimit,
+		"refund_per_ip_per_hour", *registerSkewDenyLimit,
 		"max_keys", ratelimit.DefaultMaxKeys,
 	)
 

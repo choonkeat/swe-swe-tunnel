@@ -42,6 +42,10 @@ func New(max int, window time.Duration) *SlidingWindow {
 	}
 }
 
+// Max returns the configured per-key limit. Zero or negative means the
+// limiter is disabled.
+func (s *SlidingWindow) Max() int { return s.max }
+
 // SetMaxKeys bounds the distinct-key map size. Insertions past the cap
 // trigger an opportunistic prune (drop keys whose timestamps have all
 // aged out); if pruning doesn't free a slot, one expired-or-oldest key

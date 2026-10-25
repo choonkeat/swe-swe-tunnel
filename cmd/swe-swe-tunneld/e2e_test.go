@@ -721,19 +721,23 @@ func sendStaleRegister(t *testing.T, hostPort string, tlsCfg *tls.Config,
 	defer stream.Close()
 
 	sig := ed25519.Sign(priv, control.RegisterSigningPayload(pub, unique, ts))
-	if err := control.WriteMessage(stream, control.KindRegister, control.Register{
+	err = control.WriteMessage(stream, control.KindRegister, control.Register{
 		Version:   control.ProtoVersion,
 		Unique:    unique,
 		Pubkey:    base64.RawStdEncoding.EncodeToString(pub),
 		Timestamp: ts,
 		Sig:       base64.RawStdEncoding.EncodeToString(sig),
-	}); err != nil {
-		t.Fatalf("write Register: %v", err)
-	}
-
-	frame, err := control.ReadFrame(stream)
-	if err != nil {
-		t.Fatalf("read response: %v", err)
+	})
+	// yamux Write can report "session shutdown" after the frame was
+	// already sent, when the server denies and closes the session
+	// before Write returns. The Deny may still be readable, so only
+	// fail if reading also fails.
+	frame, rerr := control.ReadFrame(stream)
+	if rerr != nil {
+		if err != nil {
+			t.Fatalf("write Register: %v (read: %v)", err, rerr)
+		}
+		t.Fatalf("read response: %v", rerr)
 	}
 	if frame.Type != control.KindDeny {
 		t.Fatalf("frame type = %q, want Deny", frame.Type)
