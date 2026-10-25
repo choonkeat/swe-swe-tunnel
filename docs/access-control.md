@@ -7,7 +7,12 @@ Two server-side gates, configured independently:
 
 ## Pubkey allowlist
 
-By default, anyone who can reach `:443/v1/connect` can register a fresh keypair under any unclaimed `unique` and consume an LE issuance. For a friends-and-family deployment that's usually fine; the per-IP and per-pubkey rate limits keep blast radius small. For more control, the daemon supports an optional Ed25519 pubkey allowlist that gates `Register` after signature verification.
+The daemon refuses to start until you choose how `Register` is gated. Set exactly one of:
+
+- `--allowlist-dir=<path>` (env `SWE_TUNNEL_ALLOWLIST_DIR`): only listed Ed25519 pubkeys may register. This is the shipped Compose default.
+- `--open-registration` (env `SWE_TUNNEL_OPEN_REGISTRATION=1`): anyone who can reach `/v1/connect` can claim any unclaimed `unique` and trigger a Let's Encrypt issuance. Only the per-IP and per-pubkey rate limits stand in the way, and a stranger can use up the apex's weekly certificate quota. Boot logs a `OPEN REGISTRATION` warning.
+
+Setting neither, or both, exits with code 2. Empty env values count as unset.
 
 ### Enabling
 
@@ -23,7 +28,8 @@ Three states, distinguishable in the boot log:
 
 | Setting | Behavior | Boot log |
 |---|---|---|
-| flag unset | open registration (default) | `allowlist disabled (no --allowlist-dir set; open registration)` |
+| neither flag | **refuses to boot** (exit 2) | `refusing to start without a registration gate ...` |
+| `--open-registration` | anyone may register | `OPEN REGISTRATION: any Ed25519 key may claim a name ...` (WARN) |
 | flag set, dir empty | **deny everyone** (explicit operator intent) | `allowlist loaded (deny-all) ... files=0 count=0` |
 | flag set, N keys | allow those N | `allowlist loaded ... files=F count=N` |
 
@@ -46,18 +52,33 @@ On a successful SIGHUP reload the daemon logs `allowlist reloaded ... added=N re
 
 ### Docker workflow
 
-The shipped `docker-compose.yml` already bind-mounts `./allowlist/` (directory, not file — single-file mounts pin the container to one inode and break atomic writes / `cp` overwrites). To enable the gate, add to your `.env`:
+The shipped `docker-compose.yml` bind-mounts `./allowlist/` (directory, not file — single-file mounts pin the container to one inode and break atomic writes / `cp` overwrites) and points `SWE_TUNNEL_ALLOWLIST_DIR` at it by default (`/etc/swe-swe-tunneld/allowlist`). A fresh install is deny-all until you add keys. To run open instead, put both lines in `.env`:
 
 ```
-SWE_TUNNEL_ALLOWLIST_DIR=/etc/swe-swe-tunneld/allowlist
+SWE_TUNNEL_ALLOWLIST_DIR=
+SWE_TUNNEL_OPEN_REGISTRATION=1
 ```
 
-Then drop key files into `./allowlist/` and signal:
+Drop key files into `./allowlist/` and signal:
 
 ```sh
 docker kill -s HUP swe-swe-tunneld
 docker logs --tail 5 swe-swe-tunneld   # expect "allowlist reloaded ..."
 ```
+
+### Releasing a claimed name
+
+A claimed `unique` stays owned by its key until you release it. Removing a key from the allowlist drops its live session but does **not** free its names. Two admin subcommands work on `{state-dir}/identities.db`:
+
+```sh
+swe-swe-tunneld identity-list                       # UNIQUE, PUBKEY, CREATED, LAST_SEEN
+swe-swe-tunneld identity-delete alice               # free the name "alice"
+swe-swe-tunneld identity-delete --purge-cert alice  # also delete *.alice-tunnel.{apex} cert files
+```
+
+In Docker: `docker compose exec swe-swe-tunneld swe-swe-tunneld identity-list`.
+
+`--purge-cert` needs the apex (`--apex` or `SWE_TUNNEL_APEX`, already set in the container). The running daemon keeps the deleted cert in memory until restart. `identity-delete` does not drop a live session for the name; remove the key from the allowlist and SIGHUP for that.
 
 ### Why gate after signature verification
 
@@ -67,6 +88,7 @@ A peer who can't sign for the claimed pubkey gets `signature invalid` regardless
 
 - Bearer-token gate on the HTTP upgrade (cheap DoS filter, layerable in front)
 - Per-key permissions (which `unique` a key may claim, expiry, labels)
+- Automatic expiry of names not seen for N days
 - Web/admin UI — the directory is the API
 - fsnotify watcher to remove the manual SIGHUP step
 - Pending-approval queue (operator approves out-of-band)

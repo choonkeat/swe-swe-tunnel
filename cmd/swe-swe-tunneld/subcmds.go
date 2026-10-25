@@ -19,7 +19,7 @@ import (
 )
 
 // runSubcommand routes one-shot CLI utility modes (mtls-init,
-// mtls-issue, mtls-sign) that execute and exit before the
+// mtls-issue, mtls-sign, identity-list, identity-delete) that execute and exit before the
 // long-running listener starts. Returns (exitCode, handled): when
 // handled is false, main() should fall through to the daemon path.
 // The shape mirrors the existing --ensure-cert one-shot flow.
@@ -34,6 +34,10 @@ func runSubcommand(args []string, stateDir string, stdout io.Writer, logger *slo
 		return runMtlsIssue(args[2:], stateDir, stdout, logger), true
 	case "mtls-sign":
 		return runMtlsSign(args[2:], stateDir, stdout, logger), true
+	case "identity-list":
+		return runIdentityList(args[2:], stateDir, stdout, logger), true
+	case "identity-delete":
+		return runIdentityDelete(args[2:], stateDir, stdout, logger), true
 	}
 	return 0, false
 }

@@ -15,7 +15,8 @@ All flags can be set via env. Every env var is also a flag, and vice versa.
 | `--ensure-cert` | — | (off) | no | Admin one-shot: issue `*.{label}.{apex}` and exit. No-op in `--no-acme` mode (issuance is external). |
 | `--register-rate-ip-per-hour` | — | `5` | no | Per-IP REGISTER limit. `0` disables. |
 | `--register-rate-pubkey-per-day` | — | `10` | no | Per-pubkey REGISTER limit. `0` disables. |
-| `--allowlist-dir` | `SWE_TUNNEL_ALLOWLIST_DIR` | (off) | no | Directory of authorized pubkey files; gates Register. See [`docs/access-control.md`](access-control.md). |
+| `--allowlist-dir` | `SWE_TUNNEL_ALLOWLIST_DIR` | (off; Compose: `/etc/swe-swe-tunneld/allowlist`) | one of these two | Directory of authorized pubkey files; gates Register. See [`docs/access-control.md`](access-control.md). |
+| `--open-registration` | `SWE_TUNNEL_OPEN_REGISTRATION` (set to `1`) | `false` | one of these two | Let any key register. The daemon refuses to boot unless exactly one of `--allowlist-dir` / `--open-registration` is set. |
 | `--allowed-ports` | `SWE_TUNNEL_ALLOWED_PORTS` | `1977,3000-3099,4000-4099,5000-5099,5173,8000-8099,8080,8081,9898,20000-29999` | no | Inline destination-port allowlist; `all` disables the gate. Restart-only. |
 | `--allowed-ports-file` | `SWE_TUNNEL_ALLOWED_PORTS_FILE` | (off) | no | File path holding the port allowlist (multi-line + `#` comments OK). SIGHUP-reloadable. Mutually exclusive with the inline form. |
 | `--mtls-ca` | `SWE_TUNNEL_MTLS_CA` | (off) | no | PEM bundle of CAs trusted for client certs. Presence enables mTLS on the public listener (`ClientAuth=RequireAndVerifyClientCert`). SIGHUP-reloadable. See [`docs/mtls.md`](mtls.md). |

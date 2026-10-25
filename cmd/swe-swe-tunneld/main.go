@@ -99,6 +99,12 @@ func main() {
 		// are reloaded on SIGHUP and live sessions whose key was removed
 		// are dropped immediately.
 		allowlistDir = flag.String("allowlist-dir", "", "directory of Ed25519 pubkey files (one per line, '#' comments); enables Register gate")
+		// open-registration: the explicit opt-out from the allowlist gate.
+		// Boot refuses to start unless exactly one of --allowlist-dir or
+		// --open-registration is set, so a missing or misspelled
+		// allowlist setting can never silently leave registration open
+		// to the internet.
+		openRegistration = flag.Bool("open-registration", false, "let ANY Ed25519 key register a name (no allowlist); mutually exclusive with --allowlist-dir")
 		// Port allowlist: gates which destination port labels in
 		// {port}.{label}.{apex} the server is willing to proxy. Default
 		// (portpolicy.DefaultSpec) covers common dev/web ports plus 9898
@@ -176,6 +182,9 @@ func main() {
 	if !flagSet("no-acme") && os.Getenv("SWE_TUNNEL_NO_ACME") == "1" {
 		*noAcme = true
 	}
+	if !flagSet("open-registration") && os.Getenv("SWE_TUNNEL_OPEN_REGISTRATION") == "1" {
+		*openRegistration = true
+	}
 	if *mtlsCA == "" {
 		*mtlsCA = os.Getenv("SWE_TUNNEL_MTLS_CA")
 	}
@@ -185,6 +194,11 @@ func main() {
 
 	if err := requireFlags(*apex, *email, *noAcme); err != nil {
 		flag.Usage()
+		logger.Error(err.Error())
+		os.Exit(2)
+	}
+
+	if err := validateRegistrationGate(*allowlistDir, *openRegistration); err != nil {
 		logger.Error(err.Error())
 		os.Exit(2)
 	}
@@ -339,7 +353,7 @@ func main() {
 			"files", allow.Files(),
 			"count", allow.Len())
 	} else {
-		logger.Info("allowlist disabled (no --allowlist-dir set; open registration)")
+		logger.Warn("OPEN REGISTRATION: any Ed25519 key may claim a name and trigger certificate issuance (--open-registration)")
 	}
 
 	reg := newRegistry()
@@ -588,6 +602,20 @@ func requireFlags(apex, email string, noAcme bool) error {
 	}
 	if !noAcme && email == "" {
 		return fmt.Errorf("--acme-email is required when ACME is enabled (or SWE_TUNNEL_ACME_EMAIL); pass --no-acme to skip ACME entirely")
+	}
+	return nil
+}
+
+// validateRegistrationGate makes the operator choose how Register is
+// gated. Exactly one of allowlistDir or openRegistration must be set:
+// neither is the old silent-open default (refused), both is ambiguous
+// (refused). Pure function so it can be unit-tested without main.
+func validateRegistrationGate(allowlistDir string, openRegistration bool) error {
+	switch {
+	case allowlistDir == "" && !openRegistration:
+		return fmt.Errorf("refusing to start without a registration gate: set --allowlist-dir (or SWE_TUNNEL_ALLOWLIST_DIR) to a directory of approved pubkeys, or pass --open-registration (or SWE_TUNNEL_OPEN_REGISTRATION=1) to let anyone register")
+	case allowlistDir != "" && openRegistration:
+		return fmt.Errorf("--allowlist-dir and --open-registration are mutually exclusive")
 	}
 	return nil
 }

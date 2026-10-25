@@ -24,20 +24,24 @@ services:
       # Set via env (not command:) so it also covers `compose run` invocations
       # that override the entrypoint args (e.g. --ensure-cert).
       SWE_TUNNEL_STATE: /var/lib/swe-swe-tunnel
-      # Optional: gate Register on a pubkey allowlist. Default unset
-      # → registration is open (today's behavior). To enable, set
-      # SWE_TUNNEL_ALLOWLIST_DIR in your .env (the directory is
-      # already bind-mounted above):
-      #
-      #   SWE_TUNNEL_ALLOWLIST_DIR=/etc/swe-swe-tunneld/allowlist
-      #
-      # Then drop one *.pub file per friend into ./allowlist/ and
-      # signal a reload+revoke with:
+      # Register gate. The daemon refuses to start unless exactly one
+      # of these is set. Default: the allowlist directory bind-mounted
+      # above, so a fresh install lets nobody register until you drop
+      # one *.pub file per user into ./allowlist/ and reload with:
       #
       #   docker kill -s HUP swe-swe-tunneld
       #
-      # An empty directory with the env set means deny-all.
-      SWE_TUNNEL_ALLOWLIST_DIR: ${SWE_TUNNEL_ALLOWLIST_DIR:-}
+      # An empty directory means deny-all. To let ANY key register
+      # (not recommended), set in .env:
+      #
+      #   SWE_TUNNEL_ALLOWLIST_DIR=
+      #   SWE_TUNNEL_OPEN_REGISTRATION=1
+      #
+      # Release a claimed name with:
+      #   docker compose exec swe-swe-tunneld swe-swe-tunneld identity-list
+      #   docker compose exec swe-swe-tunneld swe-swe-tunneld identity-delete [--purge-cert] <unique>
+      SWE_TUNNEL_ALLOWLIST_DIR: ${SWE_TUNNEL_ALLOWLIST_DIR-/etc/swe-swe-tunneld/allowlist}
+      SWE_TUNNEL_OPEN_REGISTRATION: ${SWE_TUNNEL_OPEN_REGISTRATION:-}
       # Optional override of the destination port allowlist.
       # Default (unset) is portpolicy.DefaultSpec —
       # 1977,3000-3099,4000-4099,5000-5099,5173,8000-8099,8080,8081,9898.

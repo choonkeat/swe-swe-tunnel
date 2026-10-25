@@ -166,3 +166,37 @@ func (s *Store) Delete(ctx context.Context, unique string) error {
 	}
 	return nil
 }
+
+// List returns every ownership record, ordered by unique name. Used by
+// the identity-list admin subcommand.
+func (s *Store) List(ctx context.Context) ([]Entry, error) {
+	rows, err := s.db.QueryContext(ctx,
+		"SELECT unique_name, pubkey, created_at, last_seen_at FROM identities ORDER BY unique_name",
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list: %w", err)
+	}
+	defer rows.Close()
+	var out []Entry
+	for rows.Next() {
+		var (
+			unique   string
+			pubkey   []byte
+			created  int64
+			lastSeen int64
+		)
+		if err := rows.Scan(&unique, &pubkey, &created, &lastSeen); err != nil {
+			return nil, fmt.Errorf("list scan: %w", err)
+		}
+		out = append(out, Entry{
+			Unique:     unique,
+			Pubkey:     ed25519.PublicKey(pubkey),
+			CreatedAt:  time.Unix(created, 0).UTC(),
+			LastSeenAt: time.Unix(lastSeen, 0).UTC(),
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list: %w", err)
+	}
+	return out, nil
+}

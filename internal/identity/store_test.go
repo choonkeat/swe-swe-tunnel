@@ -135,3 +135,47 @@ func TestStore_Put_ConcurrentRaceReturnsErrAlreadyExists(t *testing.T) {
 		t.Errorf("other-error count = %d, want 0", other)
 	}
 }
+
+func TestStore_List(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "ids.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+
+	got, err := s.List(ctx)
+	if err != nil || len(got) != 0 {
+		t.Fatalf("List(empty) = %v, %v; want empty, nil", got, err)
+	}
+
+	pubA, _, _ := ed25519.GenerateKey(rand.Reader)
+	pubB, _, _ := ed25519.GenerateKey(rand.Reader)
+	t0 := time.Unix(1714137600, 0)
+	// Insert out of order to prove List sorts by unique.
+	if err := s.Put(ctx, "zed", pubB, t0); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Put(ctx, "abc", pubA, t0.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err = s.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].Unique != "abc" || got[1].Unique != "zed" {
+		t.Fatalf("List order = %+v; want abc, zed", got)
+	}
+	if !bytes.Equal(got[0].Pubkey, pubA) || !got[0].CreatedAt.Equal(t0.Add(time.Hour)) {
+		t.Errorf("abc row = %+v", got[0])
+	}
+
+	if err := s.Delete(ctx, "abc"); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = s.List(ctx)
+	if len(got) != 1 || got[0].Unique != "zed" {
+		t.Errorf("after Delete, List = %+v; want only zed", got)
+	}
+}
