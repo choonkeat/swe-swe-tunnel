@@ -1,9 +1,37 @@
 services:
+  # One-shot: hand the state volume to the unprivileged daemon user.
+  # Volumes created before the daemon dropped root hold root-owned
+  # files (identities.db, certs, CA keys). Runs as root on every `up`,
+  # touches only the volume, and exits; chown is a no-op when already
+  # correct. No network, no capabilities beyond CHOWN/FOWNER.
+  volume-perms:
+    image: alpine:3.22
+    user: "0:0"
+    entrypoint: ["chown", "-R", "10001:10001", "/var/lib/swe-swe-tunnel"]
+    network_mode: none
+    cap_drop: [ALL]
+    cap_add: [CHOWN, FOWNER]
+    security_opt: ["no-new-privileges:true"]
+    volumes:
+      - tunnel-data:/var/lib/swe-swe-tunnel
+    restart: "no"
+
   swe-swe-tunneld:
     build: .
     image: swe-swe-tunneld
     container_name: swe-swe-tunneld
     restart: unless-stopped
+    depends_on:
+      volume-perms:
+        condition: service_completed_successfully
+    # Unprivileged: UID 10001 (set in the Dockerfile), no Linux
+    # capabilities, no privilege gain via setuid binaries. Binding :443
+    # works because unprivileged ports start at 0 in this container.
+    user: "10001:10001"
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    sysctls:
+      net.ipv4.ip_unprivileged_port_start: 0
     ports:
       - "443:443"
     volumes:
