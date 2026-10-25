@@ -36,3 +36,10 @@ docker-compose.override.yml
 # Sensitive (LE account key, CA private key, DNS API token); never
 # travel via the codebase.
 /backups/
+
+# Chat-log viewer. The swe-swe tool writes these into every workspace's
+# agent-chats/ folder and rewrites them on upgrade. Only the chat
+# transcripts (.md) and their assets belong in this repo.
+/agent-chats/index.html
+/agent-chats/assets/viewer.css
+/agent-chats/assets/viewer.js
