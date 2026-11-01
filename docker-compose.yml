@@ -10,7 +10,7 @@ services:
     entrypoint: ["chown", "-R", "10001:10001", "/var/lib/swe-swe-tunnel"]
     network_mode: none
     cap_drop: [ALL]
-    cap_add: [CHOWN, FOWNER]
+    cap_add: [CHOWN, FOWNER, DAC_READ_SEARCH]
     security_opt: ["no-new-privileges:true"]
     volumes:
       - tunnel-data:/var/lib/swe-swe-tunnel
